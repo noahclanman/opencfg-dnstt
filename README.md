@@ -1,4 +1,4 @@
-# OpenCFG DNSTT Manager
+# OpenCFG DNSTT Manager 
 
 A simple DNSTT / SlowDNS manager for SSH, Dropbear, Xray, V2Ray, and 3x-ui.
 
