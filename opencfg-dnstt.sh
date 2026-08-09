@@ -22,7 +22,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="OpenCFG DNSTT Manager"
-APP_VERSION="1.0.0"
+APP_VERSION="1.0.1"
 AUTHOR="Shinusterben / OpenCFG"
 
 BASE_DIR="/etc/opencfg-dnstt"
@@ -32,7 +32,7 @@ PUBKEY_FILE="${BASE_DIR}/server.pub"
 RUNNER_FILE="/usr/local/lib/opencfg-dnstt/run"
 SERVICE_FILE="/etc/systemd/system/opencfg-dnstt.service"
 SERVICE_NAME="opencfg-dnstt.service"
-DNSTT_BIN="/usr/local/bin/dnstt-server"
+DNSTT_BIN="/usr/local/lib/opencfg-dnstt/dnstt-server"
 MANAGER_PATH="/usr/local/sbin/opencfg-dnstt"
 MANAGER_LINK="/usr/local/bin/opencfg-dnstt"
 
@@ -93,6 +93,39 @@ valid_mtu() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( 512 <= 10#$1 && 10#$1 <= 4096 ))
 }
 
+valid_backend_host() {
+    local host="$1"
+    [[ -n "$host" && ${#host} -le 253 ]] || return 1
+    [[ "$host" != *$'\n'* && "$host" != *$'\r'* ]] || return 1
+
+    if [[ "$host" == "localhost" ]]; then
+        return 0
+    fi
+
+    # Accept normal DNS hostnames, IPv4 literals, and IPv6 literals.
+    if [[ "$host" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        return 0
+    fi
+
+    if [[ "$host" == *:* && "$host" =~ ^[0-9A-Fa-f:.%_-]+$ ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+format_backend_address() {
+    local host="$1"
+    local port="$2"
+
+    # net.Dial-style host:port syntax requires brackets around IPv6 literals.
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
 detect_bind_ipv4() {
     local ip=""
     ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '
@@ -150,7 +183,7 @@ show_dashboard() {
         echo -e "  Mode    : ${WHITE}${BACKEND_MODE:-Custom}${NC}"
         echo -e "  Domain  : ${WHITE}${TUNNEL_DOMAIN:-Not configured}${NC}"
         echo -e "  Listen  : ${WHITE}${BIND_ADDR:-?}:53/udp${NC}"
-        echo -e "  Backend : ${WHITE}${BACKEND_HOST:-127.0.0.1}:${BACKEND_PORT:-?}${NC}"
+        echo -e "  Backend : ${WHITE}$(format_backend_address "${BACKEND_HOST:-127.0.0.1}" "${BACKEND_PORT:-?}")${NC}"
         echo -e "  MTU     : ${WHITE}${MTU:-1232}${NC}"
     fi
     echo
@@ -240,6 +273,7 @@ build_dnstt() {
         die "Built dnstt-server binary was not found."
     }
 
+    mkdir -p "$(dirname "$DNSTT_BIN")"
     install -m 0755 "${gobin}/dnstt-server" "$DNSTT_BIN"
     rm -rf "$tmp"
     ok "Installed ${DNSTT_BIN} from DNSTT ${DNSTT_VERSION} source."
@@ -288,7 +322,7 @@ write_runner() {
 set -Eeuo pipefail
 
 CONFIG_FILE="/etc/opencfg-dnstt/config"
-DNSTT_BIN="/usr/local/bin/dnstt-server"
+DNSTT_BIN="/usr/local/lib/opencfg-dnstt/dnstt-server"
 
 [[ -r "$CONFIG_FILE" ]] || {
     echo "Missing config: $CONFIG_FILE" >&2
@@ -298,12 +332,18 @@ DNSTT_BIN="/usr/local/bin/dnstt-server"
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 
+if [[ "$BACKEND_HOST" == *:* && "$BACKEND_HOST" != \[*\] ]]; then
+    BACKEND_ADDR="[${BACKEND_HOST}]:${BACKEND_PORT}"
+else
+    BACKEND_ADDR="${BACKEND_HOST}:${BACKEND_PORT}"
+fi
+
 exec "$DNSTT_BIN" \
     -udp "${BIND_ADDR}:53" \
     -mtu "${MTU}" \
     -privkey-file "${PRIVKEY_FILE}" \
     "${TUNNEL_DOMAIN}" \
-    "${BACKEND_HOST}:${BACKEND_PORT}"
+    "${BACKEND_ADDR}"
 RUNNER
 
     chmod 0755 "$RUNNER_FILE"
@@ -394,16 +434,19 @@ save_config() {
 # Managed by opencfg-dnstt. You may edit this file manually, then restart:
 # systemctl restart opencfg-dnstt
 
-TUNNEL_DOMAIN="${tunnel_domain}"
-NS_HOST="${ns_host}"
-BIND_ADDR="${bind_addr}"
-BACKEND_HOST="${backend_host}"
-BACKEND_PORT="${backend_port}"
-BACKEND_MODE="${backend_mode}"
-MTU="${mtu}"
-PRIVKEY_FILE="${PRIVKEY_FILE}"
-PUBKEY_FILE="${PUBKEY_FILE}"
 EOF
+
+    {
+        printf 'TUNNEL_DOMAIN=%q\n' "$tunnel_domain"
+        printf 'NS_HOST=%q\n' "$ns_host"
+        printf 'BIND_ADDR=%q\n' "$bind_addr"
+        printf 'BACKEND_HOST=%q\n' "$backend_host"
+        printf 'BACKEND_PORT=%q\n' "$backend_port"
+        printf 'BACKEND_MODE=%q\n' "$backend_mode"
+        printf 'MTU=%q\n' "$mtu"
+        printf 'PRIVKEY_FILE=%q\n' "$PRIVKEY_FILE"
+        printf 'PUBKEY_FILE=%q\n' "$PUBKEY_FILE"
+    } >> "$CONFIG_FILE"
 
     chmod 0600 "$CONFIG_FILE"
 }
@@ -498,8 +541,12 @@ configure_interactive() {
         warn "Choose an IPv4 address that is actually assigned to this VPS."
     done
 
-    read -r -p "Backend host [${old_backend_host}]: " backend_host
-    backend_host="${backend_host:-$old_backend_host}"
+    while true; do
+        read -r -p "Backend host [${old_backend_host}]: " backend_host
+        backend_host="${backend_host:-$old_backend_host}"
+        valid_backend_host "$backend_host" && break
+        warn "Enter a valid hostname, IPv4 address, or IPv6 address."
+    done
 
     while true; do
         read -r -p "Backend TCP port [${backend_port}]: " answer
@@ -542,7 +589,7 @@ install_or_reconfigure() {
     if [[ ! -x "$DNSTT_BIN" ]]; then
         build_dnstt
     else
-        ok "Existing dnstt-server found: $DNSTT_BIN"
+        ok "Existing OpenCFG dnstt-server found: $DNSTT_BIN"
     fi
 
     generate_keys_if_needed
@@ -560,7 +607,11 @@ install_or_reconfigure() {
         return 0
     fi
 
-    systemctl enable --now "$SERVICE_NAME"
+    if ! systemctl enable --now "$SERVICE_NAME"; then
+        warn "DNSTT failed to enable or start. Recent logs:"
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+        return 0
+    fi
 
     sleep 1
     if systemctl is-active --quiet "$SERVICE_NAME"; then
@@ -590,7 +641,7 @@ show_info_no_pause() {
     echo -e "Tunnel domain   : ${WHITE}${TUNNEL_DOMAIN}${NC}"
     echo -e "Nameserver host : ${WHITE}${NS_HOST}${NC}"
     echo -e "Local UDP bind  : ${WHITE}${BIND_ADDR}:53${NC}"
-    echo -e "Backend         : ${WHITE}${BACKEND_HOST}:${BACKEND_PORT}${NC}"
+    echo -e "Backend         : ${WHITE}$(format_backend_address "$BACKEND_HOST" "$BACKEND_PORT")${NC}"
     echo -e "MTU             : ${WHITE}${MTU}${NC}"
     echo -e "Public key      : ${WHITE}${pubkey:-Unavailable}${NC}"
     [[ -n "$public_ip" ]] && echo -e "Public IPv4     : ${WHITE}${public_ip}${NC}"
@@ -627,7 +678,7 @@ change_backend() {
     header
     echo -e "${WHITE}Change backend only${NC}"
     echo
-    echo "Current: ${BACKEND_MODE} -> ${BACKEND_HOST}:${BACKEND_PORT}"
+    echo "Current: ${BACKEND_MODE} -> $(format_backend_address "$BACKEND_HOST" "$BACKEND_PORT")"
     echo
     echo "  1) SSH / Dropbear"
     echo "  2) Xray / V2Ray / 3x-ui"
@@ -649,8 +700,12 @@ change_backend() {
             ;;
     esac
 
-    read -r -p "Backend host [${new_host}]: " answer
-    new_host="${answer:-$new_host}"
+    while true; do
+        read -r -p "Backend host [${new_host}]: " answer
+        new_host="${answer:-$new_host}"
+        valid_backend_host "$new_host" && break
+        warn "Enter a valid hostname, IPv4 address, or IPv6 address."
+    done
 
     while true; do
         read -r -p "Backend port [${new_port}]: " answer
@@ -669,12 +724,18 @@ change_backend() {
         "$MTU"
 
     check_backend_listener "$new_host" "$new_port"
-    systemctl restart "$SERVICE_NAME"
+    if ! systemctl restart "$SERVICE_NAME"; then
+        warn "DNSTT failed to restart after changing the backend."
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+        pause
+        return
+    fi
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Backend changed to ${new_host}:${new_port}."
+        ok "Backend changed to $(format_backend_address "$new_host" "$new_port")."
     else
-        warn "DNSTT failed to restart. Check logs from the menu."
+        warn "DNSTT did not stay active after the backend change."
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
     fi
     pause
 }
@@ -717,7 +778,12 @@ change_domain() {
         "$BACKEND_MODE" \
         "$MTU"
 
-    systemctl restart "$SERVICE_NAME"
+    if ! systemctl restart "$SERVICE_NAME"; then
+        warn "Tunnel settings were saved, but DNSTT failed to restart."
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+        pause
+        return
+    fi
     ok "Tunnel domain settings updated."
     echo
     show_info_no_pause
@@ -737,37 +803,52 @@ start_service() {
         return
     }
 
-    if ! check_udp53 "$BIND_ADDR"; then
-        # If the existing listener is our own already-running service, this
-        # path is only reached when trying to start while already active.
-        if systemctl is-active --quiet "$SERVICE_NAME"; then
-            ok "OpenCFG DNSTT is already running."
-        else
-            warn "Cannot start because UDP/53 is occupied."
-        fi
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "OpenCFG DNSTT is already running."
         pause
         return
     fi
 
-    systemctl start "$SERVICE_NAME"
+    if ! check_udp53 "$BIND_ADDR"; then
+        warn "Cannot start because UDP/53 is occupied."
+        pause
+        return
+    fi
+
+    if ! systemctl start "$SERVICE_NAME"; then
+        warn "OpenCFG DNSTT failed to start. Recent logs:"
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+        pause
+        return
+    fi
     ok "OpenCFG DNSTT started."
     pause
 }
 
 restart_service() {
     require_root
-    systemctl restart "$SERVICE_NAME"
+    if ! systemctl restart "$SERVICE_NAME"; then
+        warn "OpenCFG DNSTT failed to restart. Recent logs:"
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+        pause
+        return
+    fi
     if systemctl is-active --quiet "$SERVICE_NAME"; then
         ok "OpenCFG DNSTT restarted."
     else
-        warn "DNSTT did not restart successfully."
+        warn "DNSTT did not stay active after restart."
+        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
     fi
     pause
 }
 
 stop_service() {
     require_root
-    systemctl stop "$SERVICE_NAME"
+    if ! systemctl stop "$SERVICE_NAME"; then
+        warn "OpenCFG DNSTT could not be stopped cleanly."
+        pause
+        return
+    fi
     ok "OpenCFG DNSTT stopped."
     pause
 }
@@ -821,7 +902,12 @@ rebuild_dnstt() {
     build_dnstt
 
     if [[ -f "$SERVICE_FILE" ]]; then
-        systemctl restart "$SERVICE_NAME" || true
+        if ! systemctl restart "$SERVICE_NAME"; then
+            warn "DNSTT was rebuilt, but the service failed to restart."
+            journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
+            pause
+            return
+        fi
     fi
 
     ok "DNSTT binary rebuilt from source."
@@ -865,10 +951,9 @@ uninstall_manager() {
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
 
-    rm -f "$RUNNER_FILE"
+    rm -f "$RUNNER_FILE" "$DNSTT_BIN"
     rmdir "$(dirname "$RUNNER_FILE")" 2>/dev/null || true
 
-    rm -f "$DNSTT_BIN"
     rm -rf "$BASE_DIR"
     rm -f "$MANAGER_LINK"
 
