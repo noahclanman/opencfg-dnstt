@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# BUILD-ID: OPENCFG-DNSTT-V1.4.0-COMPAT-20260810
+# BUILD-ID: OPENCFG-DNSTT-V1.5.0-LEITURA-NET-COMPAT-20260810
 # ==============================================================================
-# OpenCFG DNSTT Manager v1.4.0
+# OpenCFG DNSTT Manager v1.5.0
 # by Shinusterben / OpenCFG
 #
 # Compatibility goal:
-#   Use the exact known-working dns-server binary revision used by the
-#   leitura/slowdns setup, but manage it safely with systemd and bind directly
-#   to the selected local IPv4 address on UDP/53.
+#   Match the user's proven working Leitura network path exactly:
+#     external UDP/53 -> iptables REDIRECT -> dns-server :5300 -> TCP backend
+#   while replacing Leitura's screen/rc.local process management with systemd.
 #
 # Safety guarantees:
-#   - No iptables/ip6tables/nftables/UFW/firewalld changes.
-#   - No /etc/rc.local changes.
-#   - No /etc/resolv.conf or systemd-resolved changes.
-#   - No SSH/Webmin/Nginx/Xray/OpenVPN changes or restarts.
+#   - Adds ONLY two tagged IPv4 iptables rules needed for DNSTT:
+#       INPUT udp/5300 ACCEPT
+#       nat PREROUTING udp/53 REDIRECT -> 5300
+#   - Never flushes/replaces firewall tables and never touches ip6tables/nftables,
+#     UFW, firewalld, /etc/rc.local, /etc/resolv.conf, or systemd-resolved.
+#   - Does not change/restart SSH, Webmin, Nginx, Xray, OpenVPN, or other VPNs.
+#   - Rules are idempotent, tagged OPENCFG-DNSTT, and removed on stop/uninstall.
 #   - Existing OpenCFG DNSTT keys are preserved; incomplete keypairs are never
 #     silently replaced.
 # ==============================================================================
@@ -22,8 +25,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="OpenCFG DNSTT Manager"
-APP_VERSION="1.4.0"
-BUILD_ID="OPENCFG-DNSTT-V1.4.0-COMPAT-20260810"
+APP_VERSION="1.5.0"
+BUILD_ID="OPENCFG-DNSTT-V1.5.0-LEITURA-NET-COMPAT-20260810"
 AUTHOR="Shinusterben / OpenCFG"
 
 BASE_DIR="/etc/opencfg-dnstt"
@@ -35,6 +38,8 @@ ENGINE_BIN="${LIB_DIR}/dns-server"
 RUNNER_FILE="${LIB_DIR}/run"
 STARTDNS_FILE="${LIB_DIR}/startdns"
 RESTARTDNS_FILE="${LIB_DIR}/restartdns"
+NET_UP_FILE="${LIB_DIR}/net-up"
+NET_DOWN_FILE="${LIB_DIR}/net-down"
 SERVICE_FILE="/etc/systemd/system/opencfg-dnstt.service"
 SERVICE_NAME="opencfg-dnstt.service"
 MANAGER_PATH="/usr/local/sbin/opencfg-dnstt"
@@ -49,6 +54,8 @@ ENGINE_GIT_BLOB_SHA1="af32b882a18040af0a6e16ea759ca6fcc511b965"
 ENGINE_URL_1="https://raw.githubusercontent.com/${ENGINE_REPO}/${ENGINE_COMMIT}/dns-server"
 ENGINE_URL_2="https://github.com/${ENGINE_REPO}/raw/${ENGINE_COMMIT}/dns-server"
 ENGINE_LABEL="leitura-compatible exact binary"
+DNS_LISTEN_PORT="5300"
+RULE_COMMENT="OPENCFG-DNSTT"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -77,7 +84,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 ensure_runtime_tools() {
     local missing=()
     local c
-    for c in systemctl ss ip sha1sum awk sed grep wc tr; do
+    for c in systemctl ss ip sha1sum awk sed grep wc tr iptables; do
         command_exists "$c" || missing+=("$c")
     done
 
@@ -93,7 +100,7 @@ ensure_runtime_tools() {
     info "Installing only required runtime packages..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl iproute2 coreutils grep sed gawk
+    apt-get install -y ca-certificates curl iproute2 coreutils grep sed gawk iptables
 }
 
 git_blob_sha1() {
@@ -219,7 +226,8 @@ collect_config() {
         echo -e "${WHITE}Existing OpenCFG DNSTT configuration:${NC}"
         echo "  Tunnel domain : $TUNNEL_DOMAIN"
         echo "  NS host       : ${NAMESERVER_HOST:-<not set>}"
-        echo "  UDP bind      : $BIND_ADDR:53"
+        echo "  UDP path      : external UDP/53 -> redirect -> :$DNS_LISTEN_PORT"
+        echo "  VPS IPv4      : $BIND_ADDR"
         echo "  Backend       : $BACKEND_HOST:$BACKEND_PORT"
         echo
         read -r -p "Keep these settings and repair/upgrade only? [Y/n]: " keep || true
@@ -245,7 +253,7 @@ collect_config() {
     prompt_value NAMESERVER_HOST "Nameserver host (example: ns.example.com)" "${NAMESERVER_HOST:-ns.example.com}"
     valid_domain "$NAMESERVER_HOST" || die "Invalid nameserver host: $NAMESERVER_HOST"
 
-    prompt_value BIND_ADDR "Local bind IPv4 for UDP/53" "${BIND_ADDR:-$def_bind}"
+    prompt_value BIND_ADDR "Local VPS IPv4" "${BIND_ADDR:-$def_bind}"
     valid_bind_ip "$BIND_ADDR" || die "$BIND_ADDR is not configured on this VPS."
 
     prompt_value BACKEND_HOST "Backend host" "${BACKEND_HOST:-127.0.0.1}"
@@ -272,6 +280,7 @@ write_config() {
         printf 'PRIVKEY_FILE=%q\n' "$PRIVKEY_FILE"
         printf 'PUBKEY_FILE=%q\n' "$PUBKEY_FILE"
         printf 'ENGINE_MODE=%q\n' "compat-exact"
+        printf 'LISTEN_MODE=%q\n' "leitura-redirect-5300"
     } > "$CONFIG_FILE"
     chmod 0600 "$CONFIG_FILE"
 }
@@ -321,9 +330,11 @@ else
     BACKEND_ADDR="${BACKEND_HOST}:${BACKEND_PORT}"
 fi
 
-# Intentionally no -mtu flag: match the known-working compatibility launch.
+# Match the proven Leitura startdns transport layout exactly:
+# dns-server itself listens on :5300; external UDP/53 is redirected to it.
+# Intentionally no -mtu flag.
 exec "$ENGINE_BIN" \
-    -udp "${BIND_ADDR}:53" \
+    -udp ":5300" \
     -privkey-file "$PRIVKEY_FILE" \
     "$TUNNEL_DOMAIN" \
     "$BACKEND_ADDR"
@@ -345,6 +356,51 @@ systemctl restart opencfg-dnstt.service
 systemctl --no-pager --full status opencfg-dnstt.service
 EOF_RESTART
     chmod 0755 "$RESTARTDNS_FILE"
+
+    # Convenience commands, without overwriting an unrelated existing file.
+    if [[ ! -e /usr/local/bin/startdns || -L /usr/local/bin/startdns ]]; then
+        ln -sfn "$STARTDNS_FILE" /usr/local/bin/startdns
+    fi
+    if [[ ! -e /usr/local/bin/restartdns || -L /usr/local/bin/restartdns ]]; then
+        ln -sfn "$RESTARTDNS_FILE" /usr/local/bin/restartdns
+    fi
+}
+
+write_network_helpers() {
+    cat > "$NET_UP_FILE" <<'NETUP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+COMMENT="OPENCFG-DNSTT"
+
+command -v iptables >/dev/null 2>&1 || {
+    echo "iptables is required for Leitura-compatible DNSTT mode" >&2
+    exit 1
+}
+
+# Same functional rules as the working Leitura setup, but tagged and idempotent.
+iptables -C INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT
+
+iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null || \
+    iptables -t nat -I PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300
+NETUP
+    chmod 0755 "$NET_UP_FILE"
+
+    cat > "$NET_DOWN_FILE" <<'NETDOWN'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+COMMENT="OPENCFG-DNSTT"
+
+if command -v iptables >/dev/null 2>&1; then
+    while iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null; do
+        iptables -t nat -D PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 || break
+    done
+    while iptables -C INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT || break
+    done
+fi
+NETDOWN
+    chmod 0755 "$NET_DOWN_FILE"
 }
 
 write_service() {
@@ -357,7 +413,9 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+ExecStartPre=${NET_UP_FILE}
 ExecStart=${RUNNER_FILE}
+ExecStopPost=${NET_DOWN_FILE}
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
@@ -371,18 +429,16 @@ EOF_SERVICE
     systemctl daemon-reload
 }
 
-udp53_conflicts() {
-    local ip="$1" escaped
-    escaped="${ip//./\\.}"
-    ss -H -lunp 2>/dev/null | grep -E "[[:space:]](${escaped}:53|0\.0\.0\.0:53|\*:53|\[::\]:53|:::53)[[:space:]]" || true
+udp5300_conflicts() {
+    ss -H -lunp 2>/dev/null | grep -E '[[:space:]](0\.0\.0\.0:5300|\*:5300|\[::\]:5300|:::5300)[[:space:]]' || true
 }
 
-check_udp53_available() {
+check_udp5300_available() {
     local conflicts
-    conflicts="$(udp53_conflicts "$BIND_ADDR")"
+    conflicts="$(udp5300_conflicts)"
     if [[ -n "$conflicts" ]]; then
         echo "$conflicts"
-        die "UDP/53 is already occupied on $BIND_ADDR (or a wildcard listener). OpenCFG did not modify the conflicting service."
+        die "UDP/5300 is already occupied. OpenCFG did not modify the conflicting service."
     fi
 }
 
@@ -399,12 +455,13 @@ install_or_repair() {
 
     # Validate the selected bind address after stopping only our own service.
     valid_bind_ip "$BIND_ADDR" || die "$BIND_ADDR is not configured on this VPS."
-    check_udp53_available
+    check_udp5300_available
 
     install_compat_engine
     ensure_keypair
     write_config
     write_runner
+    write_network_helpers
     write_service
 
     systemctl enable "$SERVICE_NAME" >/dev/null
@@ -425,7 +482,7 @@ install_or_repair() {
     echo "  Build ID        : $BUILD_ID"
     echo "  Engine          : exact compatibility blob $ENGINE_GIT_BLOB_SHA1"
     echo "  Tunnel domain   : $TUNNEL_DOMAIN"
-    echo "  UDP listener    : $BIND_ADDR:53"
+    echo "  UDP path        : external :53 -> REDIRECT -> :5300"
     echo "  Backend         : $BACKEND_HOST:$BACKEND_PORT"
     echo "  Public key      : $(tr -d '[:space:]' < "$PUBKEY_FILE")"
     echo
@@ -450,7 +507,8 @@ show_config() {
     fi
     echo "Tunnel domain : $TUNNEL_DOMAIN"
     echo "NS host       : ${NAMESERVER_HOST:-}"
-    echo "UDP bind      : $BIND_ADDR:53"
+    echo "UDP path      : external :53 -> REDIRECT -> :5300"
+    echo "VPS IPv4      : $BIND_ADDR"
     echo "Backend       : $BACKEND_HOST:$BACKEND_PORT"
     echo "Public key    : $(tr -d '[:space:]' < "$PUBKEY_FILE" 2>/dev/null || true)"
     echo "Engine blob   : $ENGINE_GIT_BLOB_SHA1"
@@ -497,7 +555,8 @@ diagnostics() {
     if load_existing_config; then
         ok "Config readable"
         echo "    tunnel=$TUNNEL_DOMAIN"
-        echo "    bind=$BIND_ADDR:53"
+        echo "    path=external UDP/53 -> REDIRECT -> :5300"
+        echo "    vps_ipv4=$BIND_ADDR"
         echo "    backend=$BACKEND_HOST:$BACKEND_PORT"
     else
         warn "Config missing/invalid"
@@ -518,15 +577,27 @@ diagnostics() {
         fail=1
     fi
 
-    if [[ -n "${BIND_ADDR:-}" ]]; then
-        listener="$(ss -H -lunp 2>/dev/null | grep -F "${BIND_ADDR}:53" || true)"
-        if [[ -n "$listener" ]]; then
-            ok "UDP/53 listener present on $BIND_ADDR"
-            echo "    $listener"
-        else
-            warn "No UDP/53 listener found on $BIND_ADDR"
-            fail=1
-        fi
+    listener="$(ss -H -lunp 2>/dev/null | grep -E '[[:space:]](0\.0\.0\.0:5300|\*:5300|\[::\]:5300|:::5300)[[:space:]]' || true)"
+    if [[ -n "$listener" ]]; then
+        ok "dns-server listener present on UDP/5300"
+        echo "    $listener"
+    else
+        warn "No dns-server UDP/5300 listener found"
+        fail=1
+    fi
+
+    if iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$RULE_COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null; then
+        ok "UDP/53 -> 5300 REDIRECT rule present"
+    else
+        warn "Missing UDP/53 -> 5300 REDIRECT rule"
+        fail=1
+    fi
+
+    if iptables -C INPUT -p udp --dport 5300 -m comment --comment "$RULE_COMMENT" -j ACCEPT 2>/dev/null; then
+        ok "UDP/5300 INPUT allow rule present"
+    else
+        warn "Missing UDP/5300 INPUT allow rule"
+        fail=1
     fi
 
     file_pub="$(tr -d '[:space:]' < "$PUBKEY_FILE" 2>/dev/null || true)"
@@ -556,7 +627,7 @@ diagnostics() {
     journalctl -u "$SERVICE_NAME" -n 25 --no-pager 2>/dev/null || true
     echo
     if ((fail == 0)); then
-        ok "Local server checks passed. This proves the engine/service/key/listener are internally consistent; it does not by itself prove recursive DNS delegation from the phone."
+        ok "Local checks passed, including the Leitura-compatible UDP/53 -> 5300 network path. Next test is the actual phone/app connection."
     else
         warn "One or more local server checks failed."
     fi
@@ -564,12 +635,13 @@ diagnostics() {
 
 uninstall_opencfg_only() {
     require_root
-    echo "This removes only OpenCFG DNSTT files/service. It will NOT touch firewall, DNS resolver, SSH, Nginx, Xray, Webmin, or other VPN software."
+    echo "This removes only OpenCFG DNSTT files/service and its two tagged iptables rules. It will NOT touch other firewall rules, DNS resolver, SSH, Nginx, Xray, Webmin, or other VPN software."
     read -r -p "Continue? [y/N]: " ans || true
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
 
     systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-    rm -f "$SERVICE_FILE" "$MANAGER_LINK" "$MANAGER_PATH"
+    [[ -x "$NET_DOWN_FILE" ]] && "$NET_DOWN_FILE" || true
+    rm -f "$SERVICE_FILE" "$MANAGER_LINK" "$MANAGER_PATH" /usr/local/bin/startdns /usr/local/bin/restartdns
     rm -rf "$LIB_DIR"
     # Keep config/keypair by default to prevent accidental client breakage.
     systemctl daemon-reload
