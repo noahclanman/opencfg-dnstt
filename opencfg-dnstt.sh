@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# BUILD-ID: OPENCFG-DNSTT-V1.7.0-CLIENT-MATCH-20260811
+# BUILD-ID: OPENCFG-DNSTT-V1.8.0-NOTRACK-STABLE-20260811
 # ==============================================================================
-# OpenCFG DNSTT Manager v1.7.0
+# OpenCFG DNSTT Manager v1.8.0
 # by Shinusterben / OpenCFG
 #
 # Compatibility/stability goal:
 #   Match the DNSTT release bundled by the OpenCFG Android client:
 #     DNSTT v1.20260501.0
-#   while keeping the proven working Leitura network path:
-#     external UDP/53 -> iptables REDIRECT -> dnstt-server :5300 -> TCP backend
+#   and avoid Linux conntrack exhaustion under sustained DNS-tunnel traffic.
+#   DNSTT binds directly to the VPS private IPv4 on UDP/53. Incoming/outgoing
+#   DNSTT UDP/53 packets are marked NOTRACK, so no NAT REDIRECT and no per-query
+#   guest conntrack state is required.
 #   The server is built with the same security-pinned KCP/smux/noise dependency
 #   versions used by tools/Build-DnsttAndroid.ps1 in OpenCFG-Client-App.
-#   systemd replaces screen/rc.local.
 #
 # Safety guarantees:
-#   - Adds ONLY two tagged IPv4 iptables rules needed for DNSTT:
-#       INPUT udp/5300 ACCEPT
-#       nat PREROUTING udp/53 REDIRECT -> 5300
+#   - Adds only targeted tagged IPv4 rules for BIND_ADDR:53:
+#       raw PREROUTING  udp dport 53 -> NOTRACK
+#       raw OUTPUT      udp sport 53 -> NOTRACK
+#       INPUT           udp dport 53 -> ACCEPT
+#       OUTPUT          udp sport 53 -> ACCEPT
 #   - Never flushes/replaces firewall tables and never touches ip6tables/nftables,
 #     UFW, firewalld, /etc/rc.local, /etc/resolv.conf, or systemd-resolved.
 #   - Does not change/restart SSH, Webmin, Nginx, Xray, OpenVPN, or other VPNs.
-#   - Rules are idempotent, tagged OPENCFG-DNSTT, and removed on stop/uninstall.
+#   - Rules are idempotent, tagged OPENCFG-DNSTT*, and removed on stop/uninstall.
 #   - Existing OpenCFG DNSTT keys are preserved; incomplete keypairs are never
 #     silently replaced.
 # ==============================================================================
@@ -29,8 +32,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="OpenCFG DNSTT Manager"
-APP_VERSION="1.7.0"
-BUILD_ID="OPENCFG-DNSTT-V1.7.0-CLIENT-MATCH-20260811"
+APP_VERSION="1.8.0"
+BUILD_ID="OPENCFG-DNSTT-V1.8.0-NOTRACK-STABLE-20260811"
 AUTHOR="Shinusterben / OpenCFG"
 
 BASE_DIR="/etc/opencfg-dnstt"
@@ -70,8 +73,9 @@ DNSTT_DEP_XNET="v0.57.0"
 DNSTT_DEP_XSYS="v0.47.0"
 DNSTT_DEP_XTEXT="v0.40.0"
 DNSTT_DEP_XTIME="v0.14.0"
-DNS_LISTEN_PORT="5300"
+DNS_LISTEN_PORT="53"
 RULE_COMMENT="OPENCFG-DNSTT"
+NOTRACK_COMMENT="OPENCFG-DNSTT-NOTRACK"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -297,7 +301,7 @@ collect_config() {
         echo -e "${WHITE}Existing OpenCFG DNSTT configuration:${NC}"
         echo "  Tunnel domain : $TUNNEL_DOMAIN"
         echo "  NS host       : ${NAMESERVER_HOST:-<not set>}"
-        echo "  UDP path      : external UDP/53 -> redirect -> :$DNS_LISTEN_PORT"
+        echo "  UDP path      : direct $BIND_ADDR:53 (NOTRACK)"
         echo "  VPS IPv4      : $BIND_ADDR"
         echo "  Backend       : $BACKEND_HOST:$BACKEND_PORT"
         echo
@@ -351,7 +355,7 @@ write_config() {
         printf 'PRIVKEY_FILE=%q\n' "$PRIVKEY_FILE"
         printf 'PUBKEY_FILE=%q\n' "$PUBKEY_FILE"
         printf 'ENGINE_MODE=%q\n' "client-matched-${DNSTT_VERSION}"
-        printf 'LISTEN_MODE=%q\n' "leitura-redirect-5300"
+        printf 'LISTEN_MODE=%q\n' "direct-53-notrack"
     } > "$CONFIG_FILE"
     chmod 0600 "$CONFIG_FILE"
 }
@@ -401,10 +405,10 @@ else
     BACKEND_ADDR="${BACKEND_HOST}:${BACKEND_PORT}"
 fi
 
-# Keep the proven Leitura transport layout: dnstt-server listens on :5300;
-# external UDP/53 is redirected to it. No forced -mtu flag.
+# Bind directly to the VPS private address on UDP/53.
+# No NAT REDIRECT and no forced -mtu flag.
 exec "$ENGINE_BIN" \
-    -udp ":5300" \
+    -udp "${BIND_ADDR}:53" \
     -privkey-file "$PRIVKEY_FILE" \
     "$TUNNEL_DOMAIN" \
     "$BACKEND_ADDR"
@@ -440,28 +444,69 @@ write_network_helpers() {
     cat > "$NET_UP_FILE" <<'NETUP'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+CONFIG_FILE="/etc/opencfg-dnstt/config"
 COMMENT="OPENCFG-DNSTT"
+NOTRACK_COMMENT="OPENCFG-DNSTT-NOTRACK"
 
 command -v iptables >/dev/null 2>&1 || {
-    echo "iptables is required for Leitura-compatible DNSTT mode" >&2
+    echo "iptables is required for OpenCFG DNSTT firewall isolation" >&2
     exit 1
 }
+[[ -r "$CONFIG_FILE" ]] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
 
-# Same functional rules as the working Leitura setup, but tagged and idempotent.
-iptables -C INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT
+# Remove legacy OpenCFG 53->5300 rules from v1.5-v1.7 only.
+while iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null; do
+    iptables -t nat -D PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 || break
+done
+while iptables -C INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null; do
+    iptables -D INPUT -p udp --dport 5300 -m comment --comment "$COMMENT" -j ACCEPT || break
+done
 
-iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null || \
-    iptables -t nat -I PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300
+# DNSTT can generate a high rate of short UDP DNS exchanges. Keep only this
+# BIND_ADDR:53 traffic out of guest conntrack to avoid nf_conntrack exhaustion.
+iptables -t raw -C PREROUTING -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK 2>/dev/null || \
+    iptables -t raw -I PREROUTING 1 -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK
+
+iptables -t raw -C OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK 2>/dev/null || \
+    iptables -t raw -I OUTPUT 1 -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK
+
+# Accept only the DNSTT socket on the selected VPS address. Insert at the top so
+# a later stateful firewall jump cannot drop ctstate UNTRACKED DNS packets.
+iptables -C INPUT -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT 1 -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$COMMENT" -j ACCEPT
+
+iptables -C OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null || \
+    iptables -I OUTPUT 1 -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$COMMENT" -j ACCEPT
 NETUP
     chmod 0755 "$NET_UP_FILE"
 
     cat > "$NET_DOWN_FILE" <<'NETDOWN'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+CONFIG_FILE="/etc/opencfg-dnstt/config"
 COMMENT="OPENCFG-DNSTT"
+NOTRACK_COMMENT="OPENCFG-DNSTT-NOTRACK"
 
-if command -v iptables >/dev/null 2>&1; then
+if command -v iptables >/dev/null 2>&1 && [[ -r "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+    while iptables -t raw -C PREROUTING -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK 2>/dev/null; do
+        iptables -t raw -D PREROUTING -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK || break
+    done
+    while iptables -t raw -C OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK 2>/dev/null; do
+        iptables -t raw -D OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK || break
+    done
+    while iptables -C INPUT -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$COMMENT" -j ACCEPT || break
+    done
+    while iptables -C OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$COMMENT" -j ACCEPT 2>/dev/null; do
+        iptables -D OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$COMMENT" -j ACCEPT || break
+    done
+
+    # Also clean legacy tagged v1.5-v1.7 rules if they still exist.
     while iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null; do
         iptables -t nat -D PREROUTING -p udp --dport 53 -m comment --comment "$COMMENT" -j REDIRECT --to-ports 5300 || break
     done
@@ -499,16 +544,22 @@ EOF_SERVICE
     systemctl daemon-reload
 }
 
-udp5300_conflicts() {
-    ss -H -lunp 2>/dev/null | grep -E '[[:space:]](0\.0\.0\.0:5300|\*:5300|\[::\]:5300|:::5300)[[:space:]]' || true
+udp53_bind_conflicts() {
+    # Binding BIND_ADDR:53 can coexist with systemd-resolved on 127.0.0.53:53.
+    ss -H -lunp 2>/dev/null | awk -v ip="$BIND_ADDR" '
+        {
+            localaddr=$4
+            if (localaddr == ip ":53" || localaddr == "0.0.0.0:53" || localaddr == "*:53" || localaddr == "[::]:53" || localaddr == ":::53")
+                print
+        }'
 }
 
-check_udp5300_available() {
+check_udp53_available() {
     local conflicts
-    conflicts="$(udp5300_conflicts)"
+    conflicts="$(udp53_bind_conflicts)"
     if [[ -n "$conflicts" ]]; then
         echo "$conflicts"
-        die "UDP/5300 is already occupied. OpenCFG did not modify the conflicting service."
+        die "UDP/53 on $BIND_ADDR is already occupied. OpenCFG did not modify the conflicting service."
     fi
 }
 
@@ -525,7 +576,7 @@ install_or_repair() {
 
     # Validate the selected bind address after stopping only our own service.
     valid_bind_ip "$BIND_ADDR" || die "$BIND_ADDR is not configured on this VPS."
-    check_udp5300_available
+    check_udp53_available
 
     build_stable_engine
     ensure_keypair
@@ -552,7 +603,7 @@ install_or_repair() {
     echo "  Build ID        : $BUILD_ID"
     echo "  Engine          : DNSTT $DNSTT_VERSION client-matched build"
     echo "  Tunnel domain   : $TUNNEL_DOMAIN"
-    echo "  UDP path        : external :53 -> REDIRECT -> :5300"
+    echo "  UDP path        : direct $BIND_ADDR:53 (NOTRACK)"
     echo "  Backend         : $BACKEND_HOST:$BACKEND_PORT"
     echo "  Public key      : $(tr -d '[:space:]' < "$PUBKEY_FILE")"
     echo
@@ -577,7 +628,7 @@ show_config() {
     fi
     echo "Tunnel domain : $TUNNEL_DOMAIN"
     echo "NS host       : ${NAMESERVER_HOST:-}"
-    echo "UDP path      : external :53 -> REDIRECT -> :5300"
+    echo "UDP path      : direct $BIND_ADDR:53 (NOTRACK)"
     echo "VPS IPv4      : $BIND_ADDR"
     echo "Backend       : $BACKEND_HOST:$BACKEND_PORT"
     echo "Public key    : $(tr -d '[:space:]' < "$PUBKEY_FILE" 2>/dev/null || true)"
@@ -625,7 +676,7 @@ diagnostics() {
     if load_existing_config; then
         ok "Config readable"
         echo "    tunnel=$TUNNEL_DOMAIN"
-        echo "    path=external UDP/53 -> REDIRECT -> :5300"
+        echo "    path=direct $BIND_ADDR:53 (NOTRACK)"
         echo "    vps_ipv4=$BIND_ADDR"
         echo "    backend=$BACKEND_HOST:$BACKEND_PORT"
     else
@@ -647,27 +698,41 @@ diagnostics() {
         fail=1
     fi
 
-    listener="$(ss -H -lunp 2>/dev/null | grep -E '[[:space:]](0\.0\.0\.0:5300|\*:5300|\[::\]:5300|:::5300)[[:space:]]' || true)"
+    listener="$(ss -H -lunp 2>/dev/null | grep -F "${BIND_ADDR}:53" || true)"
     if [[ -n "$listener" ]]; then
-        ok "dns-server listener present on UDP/5300"
+        ok "dnstt-server listener present on ${BIND_ADDR}:53/udp"
         echo "    $listener"
     else
-        warn "No dns-server UDP/5300 listener found"
+        warn "No dnstt-server listener found on ${BIND_ADDR}:53/udp"
         fail=1
     fi
 
-    if iptables -t nat -C PREROUTING -p udp --dport 53 -m comment --comment "$RULE_COMMENT" -j REDIRECT --to-ports 5300 2>/dev/null; then
-        ok "UDP/53 -> 5300 REDIRECT rule present"
+    if iptables -t raw -C PREROUTING -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK 2>/dev/null; then
+        ok "Incoming DNSTT UDP/53 is NOTRACK"
     else
-        warn "Missing UDP/53 -> 5300 REDIRECT rule"
+        warn "Missing raw PREROUTING NOTRACK rule for ${BIND_ADDR}:53"
         fail=1
     fi
 
-    if iptables -C INPUT -p udp --dport 5300 -m comment --comment "$RULE_COMMENT" -j ACCEPT 2>/dev/null; then
-        ok "UDP/5300 INPUT allow rule present"
+    if iptables -t raw -C OUTPUT -s "$BIND_ADDR" -p udp --sport 53 -m comment --comment "$NOTRACK_COMMENT" -j NOTRACK 2>/dev/null; then
+        ok "Outgoing DNSTT UDP/53 is NOTRACK"
     else
-        warn "Missing UDP/5300 INPUT allow rule"
+        warn "Missing raw OUTPUT NOTRACK rule for ${BIND_ADDR}:53"
         fail=1
+    fi
+
+    if iptables -C INPUT -d "$BIND_ADDR" -p udp --dport 53 -m comment --comment "$RULE_COMMENT" -j ACCEPT 2>/dev/null; then
+        ok "UDP/53 INPUT allow rule present for $BIND_ADDR"
+    else
+        warn "Missing UDP/53 INPUT allow rule for $BIND_ADDR"
+        fail=1
+    fi
+
+    if [[ -r /proc/sys/net/netfilter/nf_conntrack_count && -r /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+        local ct_count ct_max
+        ct_count="$(cat /proc/sys/net/netfilter/nf_conntrack_count)"
+        ct_max="$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+        echo "    guest conntrack: ${ct_count}/${ct_max} entries"
     fi
 
     file_pub="$(tr -d '[:space:]' < "$PUBKEY_FILE" 2>/dev/null || true)"
@@ -697,7 +762,7 @@ diagnostics() {
     journalctl -u "$SERVICE_NAME" -n 25 --no-pager 2>/dev/null || true
     echo
     if ((fail == 0)); then
-        ok "Local checks passed, including the Leitura-compatible UDP/53 -> 5300 network path. Next test is the actual phone/app connection."
+        ok "Local checks passed, including direct UDP/53 with DNSTT NOTRACK isolation."
     else
         warn "One or more local server checks failed."
     fi
@@ -705,7 +770,7 @@ diagnostics() {
 
 uninstall_opencfg_only() {
     require_root
-    echo "This removes only OpenCFG DNSTT files/service and its two tagged iptables rules. It will NOT touch other firewall rules, DNS resolver, SSH, Nginx, Xray, Webmin, or other VPN software."
+    echo "This removes only OpenCFG DNSTT files/service and its tagged UDP/53 firewall rules. It will NOT touch other firewall rules, DNS resolver, SSH, Nginx, Xray, Webmin, or other VPN software."
     read -r -p "Continue? [y/N]: " ans || true
     [[ "$ans" =~ ^[Yy]$ ]] || return 0
 
