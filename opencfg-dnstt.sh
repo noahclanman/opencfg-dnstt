@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# BUILD-ID: OPENCFG-DNSTT-V1.5.0-LEITURA-NET-COMPAT-20260810
+# BUILD-ID: OPENCFG-DNSTT-V1.6.0-STABLE-20260811
 # ==============================================================================
-# OpenCFG DNSTT Manager v1.5.0
+# OpenCFG DNSTT Manager v1.6.0
 # by Shinusterben / OpenCFG
 #
-# Compatibility goal:
-#   Match the user's proven working Leitura network path exactly:
-#     external UDP/53 -> iptables REDIRECT -> dns-server :5300 -> TCP backend
-#   while replacing Leitura's screen/rc.local process management with systemd.
+# Compatibility/stability goal:
+#   Keep the proven working Leitura network path:
+#     external UDP/53 -> iptables REDIRECT -> dnstt-server :5300 -> TCP backend
+#   but use DNSTT v1.20210803.0, whose upstream release specifically enlarged
+#   buffers/network windows for faster downloads. systemd replaces screen/rc.local.
 #
 # Safety guarantees:
 #   - Adds ONLY two tagged IPv4 iptables rules needed for DNSTT:
@@ -25,8 +26,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="OpenCFG DNSTT Manager"
-APP_VERSION="1.5.0"
-BUILD_ID="OPENCFG-DNSTT-V1.5.0-LEITURA-NET-COMPAT-20260810"
+APP_VERSION="1.6.0"
+BUILD_ID="OPENCFG-DNSTT-V1.6.0-STABLE-20260811"
 AUTHOR="Shinusterben / OpenCFG"
 
 BASE_DIR="/etc/opencfg-dnstt"
@@ -34,7 +35,7 @@ CONFIG_FILE="${BASE_DIR}/config"
 PRIVKEY_FILE="${BASE_DIR}/server.key"
 PUBKEY_FILE="${BASE_DIR}/server.pub"
 LIB_DIR="/usr/local/lib/opencfg-dnstt"
-ENGINE_BIN="${LIB_DIR}/dns-server"
+ENGINE_BIN="${LIB_DIR}/dnstt-server"
 RUNNER_FILE="${LIB_DIR}/run"
 STARTDNS_FILE="${LIB_DIR}/startdns"
 RESTARTDNS_FILE="${LIB_DIR}/restartdns"
@@ -46,14 +47,14 @@ MANAGER_PATH="/usr/local/sbin/opencfg-dnstt"
 MANAGER_LINK="/usr/local/bin/opencfg-dnstt"
 ENGINE_MARKER_FILE="${BASE_DIR}/engine"
 
-# Exact leitura/slowdns binary revision that was already present in May 2021.
-# We verify the Git blob SHA-1 over the downloaded bytes before installation.
-ENGINE_REPO="leitura/slowdns"
-ENGINE_COMMIT="9b25d1d56e4723be3c445ba6186d33b0ff7c74d9"
-ENGINE_GIT_BLOB_SHA1="af32b882a18040af0a6e16ea759ca6fcc511b965"
-ENGINE_URL_1="https://raw.githubusercontent.com/${ENGINE_REPO}/${ENGINE_COMMIT}/dns-server"
-ENGINE_URL_2="https://github.com/${ENGINE_REPO}/raw/${ENGINE_COMMIT}/dns-server"
-ENGINE_LABEL="leitura-compatible exact binary"
+# Stable upstream DNSTT engine. v1.20210803.0 is the first release after the
+# old Leitura-era build that specifically tuned buffers and network receive
+# windows for faster downloads, while retaining the same DNSTT protocol layout.
+DNSTT_VERSION="v1.20210803.0"
+GO_VERSION="1.26.5"
+GO_ROOT="/opt/opencfg-dnstt-go"
+GO_BIN="${GO_ROOT}/bin/go"
+ENGINE_LABEL="DNSTT ${DNSTT_VERSION} stable-performance build"
 DNS_LISTEN_PORT="5300"
 RULE_COMMENT="OPENCFG-DNSTT"
 
@@ -84,7 +85,7 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 ensure_runtime_tools() {
     local missing=()
     local c
-    for c in systemctl ss ip sha1sum awk sed grep wc tr iptables; do
+    for c in systemctl ss ip sha256sum awk sed grep wc tr iptables; do
         command_exists "$c" || missing+=("$c")
     done
 
@@ -103,70 +104,81 @@ ensure_runtime_tools() {
     apt-get install -y ca-certificates curl iproute2 coreutils grep sed gawk iptables
 }
 
-git_blob_sha1() {
-    local file="$1" size
-    size="$(wc -c < "$file" | tr -d '[:space:]')"
-    { printf 'blob %s\0' "$size"; cat "$file"; } | sha1sum | awk '{print $1}'
-}
-
-download_file() {
-    local url="$1" out="$2"
-    if command_exists curl; then
-        curl -fL --retry 3 --retry-delay 1 --connect-timeout 15 --max-time 180 "$url" -o "$out"
-    else
-        wget -O "$out" --timeout=20 --tries=3 "$url"
-    fi
-}
-
-engine_is_exact() {
-    [[ -f "$ENGINE_BIN" ]] || return 1
-    local got
-    got="$(git_blob_sha1 "$ENGINE_BIN" 2>/dev/null || true)"
-    [[ "$got" == "$ENGINE_GIT_BLOB_SHA1" ]]
-}
-
-install_compat_engine() {
-    local arch tmp got
+install_private_go() {
+    local arch go_arch go_sha256 tmp tarball url actual_sha256
     arch="$(uname -m)"
     case "$arch" in
-        x86_64|amd64) ;;
-        *) die "The exact compatibility engine is Linux x86_64 only; detected: $arch. Refusing to install a guessed replacement." ;;
+        x86_64|amd64)
+            go_arch="amd64"
+            go_sha256="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
+            ;;
+        aarch64|arm64)
+            go_arch="arm64"
+            go_sha256="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
+            ;;
+        *) die "Unsupported CPU architecture for automatic Go bootstrap: $arch" ;;
     esac
+
+    if [[ -x "$GO_BIN" ]]; then
+        return 0
+    fi
+
+    info "Installing private Go ${GO_VERSION} toolchain for DNSTT build..."
+    tmp="$(mktemp -d)"
+    tarball="${tmp}/go.tar.gz"
+    url="https://go.dev/dl/go${GO_VERSION}.linux-${go_arch}.tar.gz"
+
+    if command_exists curl; then
+        curl -fL --retry 3 --connect-timeout 15 "$url" -o "$tarball" || die "Could not download Go ${GO_VERSION}."
+    else
+        wget -O "$tarball" --timeout=20 --tries=3 "$url" || die "Could not download Go ${GO_VERSION}."
+    fi
+    actual_sha256="$(sha256sum "$tarball" | awk '{print $1}')"
+    [[ "$actual_sha256" == "$go_sha256" ]] || { rm -rf "$tmp"; die "Go toolchain checksum verification failed."; }
+
+    rm -rf "$GO_ROOT"
+    tar -C "$tmp" -xzf "$tarball"
+    mv "$tmp/go" "$GO_ROOT"
+    rm -rf "$tmp"
+    [[ -x "$GO_BIN" ]] || die "Go toolchain installation failed."
+}
+
+engine_is_stable() {
+    [[ -x "$ENGINE_BIN" && -r "$ENGINE_MARKER_FILE" ]] || return 1
+    [[ "$(tr -d '[:space:]' < "$ENGINE_MARKER_FILE" 2>/dev/null)" == "$DNSTT_VERSION" ]] || return 1
+    "$ENGINE_BIN" -h 2>&1 | grep -q -- '-udp' || return 1
+}
+
+build_stable_engine() {
+    local tmp gobin
+    if engine_is_stable; then
+        ok "Stable DNSTT ${DNSTT_VERSION} engine already installed."
+        return 0
+    fi
+
+    install_private_go
+    info "Building DNSTT ${DNSTT_VERSION} from upstream Go module..."
+    tmp="$(mktemp -d)"
+    gobin="${tmp}/bin"
+    mkdir -p "$gobin"
+
+    if ! env GOBIN="$gobin" GOPROXY="https://proxy.golang.org,direct" GOTOOLCHAIN="auto" \
+        "$GO_BIN" install "www.bamsoftware.com/git/dnstt.git/dnstt-server@${DNSTT_VERSION}"; then
+        rm -rf "$tmp"
+        die "DNSTT ${DNSTT_VERSION} source build failed. Existing engine was not replaced."
+    fi
+    [[ -x "${gobin}/dnstt-server" ]] || { rm -rf "$tmp"; die "Built dnstt-server binary not found."; }
 
     mkdir -p "$LIB_DIR" "$BASE_DIR"
     chmod 0755 "$LIB_DIR"
     chmod 0700 "$BASE_DIR"
-
-    if engine_is_exact; then
-        ok "Exact compatibility engine already installed."
-        printf '%s\n' "${ENGINE_REPO}@${ENGINE_COMMIT} blob=${ENGINE_GIT_BLOB_SHA1}" > "$ENGINE_MARKER_FILE"
-        chmod 0644 "$ENGINE_MARKER_FILE"
-        return 0
-    fi
-
-    info "Downloading pinned compatibility engine..."
-    tmp="$(mktemp "${LIB_DIR}/.dns-server.XXXXXX")"
-    trap 'rm -f "${tmp:-}"' RETURN
-
-    if ! download_file "$ENGINE_URL_1" "$tmp"; then
-        warn "Primary GitHub raw download failed; trying fallback URL."
-        download_file "$ENGINE_URL_2" "$tmp" || die "Could not download compatibility engine."
-    fi
-
-    [[ -s "$tmp" ]] || die "Downloaded engine is empty."
-    got="$(git_blob_sha1 "$tmp")"
-    [[ "$got" == "$ENGINE_GIT_BLOB_SHA1" ]] || {
-        rm -f "$tmp"
-        die "Engine verification failed. Expected Git blob ${ENGINE_GIT_BLOB_SHA1}, got ${got}. Nothing was installed."
-    }
-
-    chmod 0755 "$tmp"
-    mv -f "$tmp" "$ENGINE_BIN"
-    trap - RETURN
-
-    printf '%s\n' "${ENGINE_REPO}@${ENGINE_COMMIT} blob=${ENGINE_GIT_BLOB_SHA1}" > "$ENGINE_MARKER_FILE"
+    install -m 0755 "${gobin}/dnstt-server" "${ENGINE_BIN}.new"
+    mv -f "${ENGINE_BIN}.new" "$ENGINE_BIN"
+    printf '%s
+' "$DNSTT_VERSION" > "$ENGINE_MARKER_FILE"
     chmod 0644 "$ENGINE_MARKER_FILE"
-    ok "Installed verified compatibility engine: $ENGINE_BIN"
+    rm -rf "$tmp"
+    ok "Installed stable DNSTT ${DNSTT_VERSION} engine."
 }
 
 install_self() {
@@ -279,7 +291,7 @@ write_config() {
         printf 'BACKEND_PORT=%q\n' "$BACKEND_PORT"
         printf 'PRIVKEY_FILE=%q\n' "$PRIVKEY_FILE"
         printf 'PUBKEY_FILE=%q\n' "$PUBKEY_FILE"
-        printf 'ENGINE_MODE=%q\n' "compat-exact"
+        printf 'ENGINE_MODE=%q\n' "stable-${DNSTT_VERSION}"
         printf 'LISTEN_MODE=%q\n' "leitura-redirect-5300"
     } > "$CONFIG_FILE"
     chmod 0600 "$CONFIG_FILE"
@@ -317,7 +329,7 @@ write_runner() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 CONFIG_FILE="/etc/opencfg-dnstt/config"
-ENGINE_BIN="/usr/local/lib/opencfg-dnstt/dns-server"
+ENGINE_BIN="/usr/local/lib/opencfg-dnstt/dnstt-server"
 
 [[ -r "$CONFIG_FILE" ]] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
 [[ -x "$ENGINE_BIN" ]] || { echo "Missing engine: $ENGINE_BIN" >&2; exit 1; }
@@ -330,9 +342,8 @@ else
     BACKEND_ADDR="${BACKEND_HOST}:${BACKEND_PORT}"
 fi
 
-# Match the proven Leitura startdns transport layout exactly:
-# dns-server itself listens on :5300; external UDP/53 is redirected to it.
-# Intentionally no -mtu flag.
+# Keep the proven Leitura transport layout: dnstt-server listens on :5300;
+# external UDP/53 is redirected to it. No forced -mtu flag.
 exec "$ENGINE_BIN" \
     -udp ":5300" \
     -privkey-file "$PRIVKEY_FILE" \
@@ -457,7 +468,7 @@ install_or_repair() {
     valid_bind_ip "$BIND_ADDR" || die "$BIND_ADDR is not configured on this VPS."
     check_udp5300_available
 
-    install_compat_engine
+    build_stable_engine
     ensure_keypair
     write_config
     write_runner
@@ -480,7 +491,7 @@ install_or_repair() {
     ok "OpenCFG DNSTT installed/repaired."
     echo "  Manager version : $APP_VERSION"
     echo "  Build ID        : $BUILD_ID"
-    echo "  Engine          : exact compatibility blob $ENGINE_GIT_BLOB_SHA1"
+    echo "  Engine          : DNSTT $DNSTT_VERSION stable-performance build"
     echo "  Tunnel domain   : $TUNNEL_DOMAIN"
     echo "  UDP path        : external :53 -> REDIRECT -> :5300"
     echo "  Backend         : $BACKEND_HOST:$BACKEND_PORT"
@@ -492,10 +503,10 @@ install_or_repair() {
 show_status() {
     echo -e "${WHITE}$APP_NAME v$APP_VERSION${NC}"
     echo "Build: $BUILD_ID"
-    if engine_is_exact; then
-        ok "Engine bytes match pinned compatibility blob."
+    if engine_is_stable; then
+        ok "Stable DNSTT $DNSTT_VERSION engine installed."
     else
-        warn "Engine is missing or does not match pinned compatibility blob."
+        warn "Stable engine missing or version marker mismatch."
     fi
     echo
     systemctl --no-pager --full status "$SERVICE_NAME" || true
@@ -511,7 +522,7 @@ show_config() {
     echo "VPS IPv4      : $BIND_ADDR"
     echo "Backend       : $BACKEND_HOST:$BACKEND_PORT"
     echo "Public key    : $(tr -d '[:space:]' < "$PUBKEY_FILE" 2>/dev/null || true)"
-    echo "Engine blob   : $ENGINE_GIT_BLOB_SHA1"
+    echo "Engine        : DNSTT $DNSTT_VERSION"
     echo
     echo "Actual launch command:"
     sed -n '/^exec "\$ENGINE_BIN"/,/"\$BACKEND_ADDR"/p' "$RUNNER_FILE" 2>/dev/null || true
@@ -545,10 +556,10 @@ diagnostics() {
     echo "Build: $BUILD_ID"
     echo
 
-    if engine_is_exact; then
-        ok "Engine hash: exact pinned compatibility binary"
+    if engine_is_stable; then
+        ok "Engine: stable DNSTT $DNSTT_VERSION"
     else
-        warn "Engine hash mismatch/missing"
+        warn "Stable DNSTT engine/version marker missing"
         fail=1
     fi
 
