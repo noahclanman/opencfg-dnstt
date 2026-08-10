@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# BUILD-ID: OPENCFG-DNSTT-V1.6.0-STABLE-20260811
+# BUILD-ID: OPENCFG-DNSTT-V1.7.0-CLIENT-MATCH-20260811
 # ==============================================================================
-# OpenCFG DNSTT Manager v1.6.0
+# OpenCFG DNSTT Manager v1.7.0
 # by Shinusterben / OpenCFG
 #
 # Compatibility/stability goal:
-#   Keep the proven working Leitura network path:
+#   Match the DNSTT release bundled by the OpenCFG Android client:
+#     DNSTT v1.20260501.0
+#   while keeping the proven working Leitura network path:
 #     external UDP/53 -> iptables REDIRECT -> dnstt-server :5300 -> TCP backend
-#   but use DNSTT v1.20210803.0, whose upstream release specifically enlarged
-#   buffers/network windows for faster downloads. systemd replaces screen/rc.local.
+#   The server is built with the same security-pinned KCP/smux/noise dependency
+#   versions used by tools/Build-DnsttAndroid.ps1 in OpenCFG-Client-App.
+#   systemd replaces screen/rc.local.
 #
 # Safety guarantees:
 #   - Adds ONLY two tagged IPv4 iptables rules needed for DNSTT:
@@ -26,8 +29,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="OpenCFG DNSTT Manager"
-APP_VERSION="1.6.0"
-BUILD_ID="OPENCFG-DNSTT-V1.6.0-STABLE-20260811"
+APP_VERSION="1.7.0"
+BUILD_ID="OPENCFG-DNSTT-V1.7.0-CLIENT-MATCH-20260811"
 AUTHOR="Shinusterben / OpenCFG"
 
 BASE_DIR="/etc/opencfg-dnstt"
@@ -47,14 +50,26 @@ MANAGER_PATH="/usr/local/sbin/opencfg-dnstt"
 MANAGER_LINK="/usr/local/bin/opencfg-dnstt"
 ENGINE_MARKER_FILE="${BASE_DIR}/engine"
 
-# Stable upstream DNSTT engine. v1.20210803.0 is the first release after the
-# old Leitura-era build that specifically tuned buffers and network receive
-# windows for faster downloads, while retaining the same DNSTT protocol layout.
-DNSTT_VERSION="v1.20210803.0"
+# Match the OpenCFG Android client's pinned DNSTT source release exactly.
+# The dependency pins below mirror tools/Build-DnsttAndroid.ps1 so client and
+# server run the same KCP/smux/noise generations instead of mixing 2026 client
+# code with a 2021 server runtime.
+DNSTT_VERSION="v1.20260501.0"
 GO_VERSION="1.26.5"
 GO_ROOT="/opt/opencfg-dnstt-go"
 GO_BIN="${GO_ROOT}/bin/go"
-ENGINE_LABEL="DNSTT ${DNSTT_VERSION} stable-performance build"
+ENGINE_LABEL="DNSTT ${DNSTT_VERSION} OpenCFG client-matched build"
+DNSTT_GO_VERSION="1.25.0"
+DNSTT_DEP_NOISE="v1.1.0"
+DNSTT_DEP_COMPRESS="v1.18.7"
+DNSTT_DEP_UTLS="v1.8.2"
+DNSTT_DEP_KCP="v5.6.72"
+DNSTT_DEP_SMUX="v1.5.57"
+DNSTT_DEP_XCRYPTO="v0.54.0"
+DNSTT_DEP_XNET="v0.57.0"
+DNSTT_DEP_XSYS="v0.47.0"
+DNSTT_DEP_XTEXT="v0.40.0"
+DNSTT_DEP_XTIME="v0.14.0"
 DNS_LISTEN_PORT="5300"
 RULE_COMMENT="OPENCFG-DNSTT"
 
@@ -150,35 +165,79 @@ engine_is_stable() {
 }
 
 build_stable_engine() {
-    local tmp gobin
+    local tmp modjson srcdir builddir gobin module
     if engine_is_stable; then
-        ok "Stable DNSTT ${DNSTT_VERSION} engine already installed."
+        ok "Client-matched DNSTT ${DNSTT_VERSION} engine already installed."
         return 0
     fi
 
     install_private_go
-    info "Building DNSTT ${DNSTT_VERSION} from upstream Go module..."
+    info "Building client-matched DNSTT ${DNSTT_VERSION} server..."
     tmp="$(mktemp -d)"
     gobin="${tmp}/bin"
     mkdir -p "$gobin"
+    module="www.bamsoftware.com/git/dnstt.git@${DNSTT_VERSION}"
+    modjson="${tmp}/module.json"
 
-    if ! env GOBIN="$gobin" GOPROXY="https://proxy.golang.org,direct" GOTOOLCHAIN="auto" \
-        "$GO_BIN" install "www.bamsoftware.com/git/dnstt.git/dnstt-server@${DNSTT_VERSION}"; then
+    if ! env GOMODCACHE="${tmp}/modcache" GOPROXY="https://proxy.golang.org,direct" GOTOOLCHAIN="local" \
+        "$GO_BIN" mod download -json "$module" > "$modjson"; then
         rm -rf "$tmp"
-        die "DNSTT ${DNSTT_VERSION} source build failed. Existing engine was not replaced."
+        die "Could not download DNSTT ${DNSTT_VERSION} source module."
     fi
-    [[ -x "${gobin}/dnstt-server" ]] || { rm -rf "$tmp"; die "Built dnstt-server binary not found."; }
+
+    srcdir="$(sed -n 's/^[[:space:]]*"Dir":[[:space:]]*"\(.*\)",[[:space:]]*$/\1/p' "$modjson" | head -n1)"
+    [[ -n "$srcdir" && -d "$srcdir" ]] || {
+        rm -rf "$tmp"
+        die "DNSTT source directory was not returned by Go module download."
+    }
+
+    builddir="${tmp}/src"
+    cp -a "$srcdir" "$builddir"
+    chmod -R u+w "$builddir"
+
+    (
+        cd "$builddir"
+
+        "$GO_BIN" mod edit "-go=${DNSTT_GO_VERSION}"
+        "$GO_BIN" mod edit "-require=github.com/flynn/noise@${DNSTT_DEP_NOISE}"
+        "$GO_BIN" mod edit "-require=github.com/klauspost/compress@${DNSTT_DEP_COMPRESS}"
+        "$GO_BIN" mod edit "-require=github.com/refraction-networking/utls@${DNSTT_DEP_UTLS}"
+        "$GO_BIN" mod edit "-require=github.com/xtaci/kcp-go/v5@${DNSTT_DEP_KCP}"
+        "$GO_BIN" mod edit "-require=github.com/xtaci/smux@${DNSTT_DEP_SMUX}"
+        "$GO_BIN" mod edit "-require=golang.org/x/crypto@${DNSTT_DEP_XCRYPTO}"
+        "$GO_BIN" mod edit "-require=golang.org/x/net@${DNSTT_DEP_XNET}"
+        "$GO_BIN" mod edit "-require=golang.org/x/sys@${DNSTT_DEP_XSYS}"
+        "$GO_BIN" mod edit "-require=golang.org/x/text@${DNSTT_DEP_XTEXT}"
+        "$GO_BIN" mod edit "-require=golang.org/x/time@${DNSTT_DEP_XTIME}"
+
+        env GOMODCACHE="${tmp}/modcache" GOPROXY="https://proxy.golang.org,direct" GOTOOLCHAIN="local" \
+            "$GO_BIN" mod tidy
+
+        # Verify the two transport dependencies most important for wire/flow behavior.
+        [[ "$(env GOMODCACHE="${tmp}/modcache" "$GO_BIN" list -m -f '{{.Version}}' github.com/xtaci/kcp-go/v5)" == "$DNSTT_DEP_KCP" ]]
+        [[ "$(env GOMODCACHE="${tmp}/modcache" "$GO_BIN" list -m -f '{{.Version}}' github.com/xtaci/smux)" == "$DNSTT_DEP_SMUX" ]]
+
+        env GOMODCACHE="${tmp}/modcache" GOPROXY="https://proxy.golang.org,direct" GOTOOLCHAIN="local" \
+            "$GO_BIN" build -trimpath -ldflags='-s -w -buildid=' -o "${gobin}/dnstt-server" ./dnstt-server
+    ) || {
+        rm -rf "$tmp"
+        die "DNSTT ${DNSTT_VERSION} client-matched server build failed. Existing engine was not replaced."
+    }
+
+    [[ -x "${gobin}/dnstt-server" ]] || {
+        rm -rf "$tmp"
+        die "Built dnstt-server binary not found."
+    }
 
     mkdir -p "$LIB_DIR" "$BASE_DIR"
     chmod 0755 "$LIB_DIR"
     chmod 0700 "$BASE_DIR"
     install -m 0755 "${gobin}/dnstt-server" "${ENGINE_BIN}.new"
     mv -f "${ENGINE_BIN}.new" "$ENGINE_BIN"
-    printf '%s
-' "$DNSTT_VERSION" > "$ENGINE_MARKER_FILE"
+    printf '%s\n' "$DNSTT_VERSION" > "$ENGINE_MARKER_FILE"
     chmod 0644 "$ENGINE_MARKER_FILE"
     rm -rf "$tmp"
-    ok "Installed stable DNSTT ${DNSTT_VERSION} engine."
+    ok "Installed client-matched DNSTT ${DNSTT_VERSION} engine."
 }
 
 install_self() {
@@ -291,7 +350,7 @@ write_config() {
         printf 'BACKEND_PORT=%q\n' "$BACKEND_PORT"
         printf 'PRIVKEY_FILE=%q\n' "$PRIVKEY_FILE"
         printf 'PUBKEY_FILE=%q\n' "$PUBKEY_FILE"
-        printf 'ENGINE_MODE=%q\n' "stable-${DNSTT_VERSION}"
+        printf 'ENGINE_MODE=%q\n' "client-matched-${DNSTT_VERSION}"
         printf 'LISTEN_MODE=%q\n' "leitura-redirect-5300"
     } > "$CONFIG_FILE"
     chmod 0600 "$CONFIG_FILE"
@@ -491,7 +550,7 @@ install_or_repair() {
     ok "OpenCFG DNSTT installed/repaired."
     echo "  Manager version : $APP_VERSION"
     echo "  Build ID        : $BUILD_ID"
-    echo "  Engine          : DNSTT $DNSTT_VERSION stable-performance build"
+    echo "  Engine          : DNSTT $DNSTT_VERSION client-matched build"
     echo "  Tunnel domain   : $TUNNEL_DOMAIN"
     echo "  UDP path        : external :53 -> REDIRECT -> :5300"
     echo "  Backend         : $BACKEND_HOST:$BACKEND_PORT"
@@ -504,7 +563,7 @@ show_status() {
     echo -e "${WHITE}$APP_NAME v$APP_VERSION${NC}"
     echo "Build: $BUILD_ID"
     if engine_is_stable; then
-        ok "Stable DNSTT $DNSTT_VERSION engine installed."
+        ok "Client-matched DNSTT $DNSTT_VERSION engine installed."
     else
         warn "Stable engine missing or version marker mismatch."
     fi
@@ -557,7 +616,7 @@ diagnostics() {
     echo
 
     if engine_is_stable; then
-        ok "Engine: stable DNSTT $DNSTT_VERSION"
+        ok "Engine: client-matched DNSTT $DNSTT_VERSION"
     else
         warn "Stable DNSTT engine/version marker missing"
         fail=1
