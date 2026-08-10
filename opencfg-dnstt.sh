@@ -1,45 +1,48 @@
 #!/usr/bin/env bash
+# BUILD-ID: OPENCFG-DNSTT-V1.3.1-20260810-UNIQUE
 # ==============================================================================
 # OpenCFG DNSTT Manager
 # by Shinusterben / OpenCFG
 #
-# Safe-by-default DNSTT installer/manager for SSH, Xray/V2Ray, or any local TCP
-# backend. Designed to coexist with 3x-ui, Webmin, SSH VPN installers, Nginx,
-# Xray, OpenVPN, and other existing services.
+# Compatibility-focused DNSTT manager for SSH / Xray / V2Ray / custom TCP.
+# Uses the exact dns-server binary revision used by Leitura SlowDNS, but wraps
+# it in a clean systemd service and does NOT install Leitura's firewall/DNS
+# modifications.
 #
-# IMPORTANT:
+# IMPORTANT SAFETY GUARANTEES:
 #   - Does NOT edit iptables/ip6tables/nftables/UFW/firewalld.
 #   - Does NOT replace /etc/rc.local.
 #   - Does NOT edit /etc/resolv.conf or stop systemd-resolved.
-#   - Does NOT restart SSH, Webmin, Xray, Nginx, or other VPN services.
-#   - DNSTT listens directly on UDP/53 on a selected local interface address.
-#
-# DNSTT source: https://www.bamsoftware.com/software/dnstt/
-# Pinned DNSTT version: v1.20260501.0
+#   - Does NOT restart SSH, Webmin, Xray, Nginx, OpenVPN, or other VPN services.
+#   - Binds DNSTT directly to UDP/53 on one selected local IPv4 address.
 # ==============================================================================
 
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 APP_NAME="OpenCFG DNSTT Manager"
-APP_VERSION="1.0.0"
+APP_VERSION="1.3.1"
 AUTHOR="Shinusterben / OpenCFG"
 
 BASE_DIR="/etc/opencfg-dnstt"
 CONFIG_FILE="${BASE_DIR}/config"
 PRIVKEY_FILE="${BASE_DIR}/server.key"
 PUBKEY_FILE="${BASE_DIR}/server.pub"
-RUNNER_FILE="/usr/local/lib/opencfg-dnstt/run"
+ENGINE_DIR="/usr/local/lib/opencfg-dnstt"
+DNSTT_BIN="${ENGINE_DIR}/dns-server"
+ENGINE_MARKER="${BASE_DIR}/engine-id"
+RUNNER_FILE="${ENGINE_DIR}/run"
 SERVICE_FILE="/etc/systemd/system/opencfg-dnstt.service"
 SERVICE_NAME="opencfg-dnstt.service"
-DNSTT_BIN="/usr/local/bin/dnstt-server"
 MANAGER_PATH="/usr/local/sbin/opencfg-dnstt"
 MANAGER_LINK="/usr/local/bin/opencfg-dnstt"
 
-DNSTT_VERSION="v1.20260501.0"
-GO_VERSION="1.26.5"
-GO_ROOT="/opt/opencfg-dnstt-go"
-GO_BIN="${GO_ROOT}/bin/go"
+# Exact Leitura dns-server revision known to work with legacy SlowDNS clients.
+# Pinned to an immutable commit and verified by its Git blob SHA-1.
+ENGINE_COMMIT="9b25d1d56e4723be3c445ba6186d33b0ff7c74d9"
+ENGINE_GIT_BLOB_SHA1="af32b882a18040af0a6e16ea759ca6fcc511b965"
+ENGINE_URL="https://raw.githubusercontent.com/leitura/slowdns/${ENGINE_COMMIT}/dns-server"
+ENGINE_ID="leitura-compat:${ENGINE_COMMIT}:${ENGINE_GIT_BLOB_SHA1}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -49,32 +52,26 @@ WHITE='\033[1;37m'
 DIM='\033[2m'
 NC='\033[0m'
 
-die() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
-    exit 1
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
-}
-
-ok() {
-    echo -e "${GREEN}[OK]${NC} $*"
-}
-
-info() {
-    echo -e "${BLUE}[INFO]${NC} $*"
-}
+die() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+ok() { echo -e "${GREEN}[OK]${NC} $*"; }
+info() { echo -e "${BLUE}[INFO]${NC} $*"; }
 
 require_root() {
-    if [[ "${EUID}" -ne 0 ]]; then
-        die "Run this manager as root: sudo $0"
-    fi
+    [[ ${EUID} -eq 0 ]] || die "Run as root: sudo $0"
 }
 
 pause() {
     echo
-    read -r -p "Press Enter to continue..." _
+    read -r -p "Press Enter to continue..." _ || true
+}
+
+header() {
+    clear 2>/dev/null || true
+    echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
+    printf "${BLUE}║${WHITE} %-58s ${BLUE}║${NC}\n" "${APP_NAME} v${APP_VERSION}"
+    printf "${BLUE}║${DIM} %-58s ${BLUE}║${NC}\n" "by ${AUTHOR}"
+    echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
 }
 
 valid_domain() {
@@ -89,175 +86,105 @@ valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 ))
 }
 
-valid_mtu() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( 512 <= 10#$1 && 10#$1 <= 4096 ))
+valid_ipv4() {
+    local ip="$1" o1 o2 o3 o4
+    IFS=. read -r o1 o2 o3 o4 <<<"$ip" || return 1
+    [[ -n "$o1" && -n "$o2" && -n "$o3" && -n "$o4" ]] || return 1
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" =~ ^[0-9]+$ ]] || return 1
+        (( 10#$o >= 0 && 10#$o <= 255 )) || return 1
+    done
 }
 
 detect_bind_ipv4() {
     local ip=""
-    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '
-        {
-            for (i = 1; i <= NF; i++) {
-                if ($i == "src" && (i + 1) <= NF) {
-                    print $(i + 1);
-                    exit
-                }
-            }
-        }' || true)"
-    if [[ -z "$ip" ]]; then
-        ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    fi
+    ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    [[ -n "$ip" ]] || ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     printf '%s' "$ip"
 }
 
 detect_public_ipv4() {
-    local ip=""
-    if command -v curl >/dev/null 2>&1; then
-        ip="$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-    fi
-    printf '%s' "$ip"
-}
-
-service_state() {
-    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        echo -e "${GREEN}ACTIVE${NC}"
-    elif systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
-        echo -e "${YELLOW}STOPPED${NC}"
-    else
-        echo -e "${DIM}NOT INSTALLED${NC}"
-    fi
+    curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true
 }
 
 load_config() {
-    [[ -f "$CONFIG_FILE" ]] || return 1
+    [[ -r "$CONFIG_FILE" ]] || return 1
     # shellcheck disable=SC1090
     source "$CONFIG_FILE"
 }
 
-header() {
-    clear
-    echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${WHITE}                 OpenCFG DNSTT Manager v${APP_VERSION}              ${BLUE}║${NC}"
-    echo -e "${BLUE}║${DIM}                  by ${AUTHOR}                    ${BLUE}║${NC}"
-    echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
-}
-
-show_dashboard() {
-    local state
-    state="$(service_state)"
-    echo -e "  Service : ${state}"
-    if load_config 2>/dev/null; then
-        echo -e "  Mode    : ${WHITE}${BACKEND_MODE:-Custom}${NC}"
-        echo -e "  Domain  : ${WHITE}${TUNNEL_DOMAIN:-Not configured}${NC}"
-        echo -e "  Listen  : ${WHITE}${BIND_ADDR:-?}:53/udp${NC}"
-        echo -e "  Backend : ${WHITE}${BACKEND_HOST:-127.0.0.1}:${BACKEND_PORT:-?}${NC}"
-        echo -e "  MTU     : ${WHITE}${MTU:-1232}${NC}"
-    fi
-    echo
-    echo -e "${DIM}Firewall policy: untouched | DNS resolver config: untouched | rc.local: untouched${NC}"
-    echo
-}
-
 install_dependencies() {
-    info "Installing only required build/runtime packages..."
+    info "Installing required runtime packages only..."
     export DEBIAN_FRONTEND=noninteractive
-
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y
-        apt-get install -y ca-certificates curl tar gzip iproute2
-    else
-        die "This installer currently supports Debian/Ubuntu systems with apt-get."
-    fi
-}
-
-install_private_go() {
-    local arch go_arch go_sha256 tmp tarball url actual_sha256
-
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64)
-            go_arch="amd64"
-            go_sha256="5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053"
-            ;;
-        aarch64|arm64)
-            go_arch="arm64"
-            go_sha256="fe4789e92b1f33358680864bbe8704289e7bb5fc207d80623c308935bd696d49"
-            ;;
-        *)
-            die "Unsupported CPU architecture for automatic Go bootstrap: $arch"
-            ;;
-    esac
-
-    if [[ -x "$GO_BIN" ]]; then
-        return 0
-    fi
-
-    info "Installing private Go ${GO_VERSION} toolchain for building DNSTT..."
-    tmp="$(mktemp -d)"
-    tarball="${tmp}/go.tar.gz"
-    url="https://go.dev/dl/go${GO_VERSION}.linux-${go_arch}.tar.gz"
-
-    curl -fL --retry 3 --connect-timeout 15 "$url" -o "$tarball" ||
-        die "Could not download Go ${GO_VERSION} from go.dev."
-
-    actual_sha256="$(sha256sum "$tarball" | awk '{print $1}')"
-    [[ "$actual_sha256" == "$go_sha256" ]] || {
-        rm -rf "$tmp"
-        die "Go toolchain checksum verification failed."
-    }
-
-    rm -rf "$GO_ROOT"
-    mkdir -p "$(dirname "$GO_ROOT")"
-    tar -C "$tmp" -xzf "$tarball"
-    mv "$tmp/go" "$GO_ROOT"
-    rm -rf "$tmp"
-
-    [[ -x "$GO_BIN" ]] || die "Go toolchain installation failed."
-}
-
-build_dnstt() {
-    local tmp gobin
-
-    install_private_go
-
-    info "Building official DNSTT ${DNSTT_VERSION} from open-source Go module..."
-    tmp="$(mktemp -d)"
-    gobin="${tmp}/bin"
-    mkdir -p "$gobin"
-
-    if ! env \
-        GOBIN="$gobin" \
-        GOPROXY="https://proxy.golang.org,direct" \
-        GOTOOLCHAIN="auto" \
-        "$GO_BIN" install "www.bamsoftware.com/git/dnstt.git/dnstt-server@${DNSTT_VERSION}"
-    then
-        rm -rf "$tmp"
-        die "DNSTT source build failed."
-    fi
-
-    [[ -x "${gobin}/dnstt-server" ]] || {
-        rm -rf "$tmp"
-        die "Built dnstt-server binary was not found."
-    }
-
-    install -m 0755 "${gobin}/dnstt-server" "$DNSTT_BIN"
-    rm -rf "$tmp"
-    ok "Installed ${DNSTT_BIN} from DNSTT ${DNSTT_VERSION} source."
+    command -v apt-get >/dev/null 2>&1 || die "Debian/Ubuntu with apt-get is required."
+    apt-get update -y
+    apt-get install -y ca-certificates curl iproute2 coreutils
 }
 
 install_self() {
-    mkdir -p "$(dirname "$MANAGER_PATH")" "$(dirname "$MANAGER_LINK")"
-
     local current
     current="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-
+    mkdir -p "$(dirname "$MANAGER_PATH")" "$(dirname "$MANAGER_LINK")"
     if [[ "$current" != "$MANAGER_PATH" ]]; then
         install -m 0755 "$current" "$MANAGER_PATH"
     else
         chmod 0755 "$MANAGER_PATH"
     fi
-
     ln -sfn "$MANAGER_PATH" "$MANAGER_LINK"
+}
+
+verify_git_blob() {
+    local file="$1" size actual
+    size="$(stat -c '%s' "$file")"
+    actual="$({ printf 'blob %s\0' "$size"; cat "$file"; } | sha1sum | awk '{print $1}')"
+    [[ "$actual" == "$ENGINE_GIT_BLOB_SHA1" ]]
+}
+
+engine_is_current() {
+    [[ -x "$DNSTT_BIN" ]] || return 1
+    [[ -r "$ENGINE_MARKER" ]] || return 1
+    [[ "$(cat "$ENGINE_MARKER" 2>/dev/null)" == "$ENGINE_ID" ]] || return 1
+    verify_git_blob "$DNSTT_BIN"
+}
+
+install_engine() {
+    local arch tmp helpout
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) ;;
+        *) die "This compatibility engine is x86_64/amd64 only. Current architecture: ${arch}" ;;
+    esac
+
+    mkdir -p "$ENGINE_DIR" "$BASE_DIR"
+    chmod 0755 "$ENGINE_DIR"
+    chmod 0700 "$BASE_DIR"
+
+    if engine_is_current; then
+        ok "Compatibility DNSTT engine already verified."
+        return 0
+    fi
+
+    info "Installing pinned SlowDNS-compatible DNSTT engine..."
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' RETURN
+
+    curl -fL --retry 4 --retry-delay 2 --connect-timeout 15 \
+        "$ENGINE_URL" -o "$tmp" || die "Failed to download compatibility DNSTT engine."
+
+    verify_git_blob "$tmp" || die "Engine integrity check failed; downloaded binary does not match pinned Git blob."
+    chmod 0755 "$tmp"
+
+    helpout="$("$tmp" -h 2>&1 || true)"
+    [[ "$helpout" == *"-udp"* && "$helpout" == *"privkey"* ]] ||
+        die "Downloaded file does not behave like the expected DNSTT server."
+
+    install -m 0755 "$tmp" "$DNSTT_BIN"
+    printf '%s\n' "$ENGINE_ID" > "$ENGINE_MARKER"
+    chmod 0644 "$ENGINE_MARKER"
+    rm -f "$tmp"
+    trap - RETURN
+
+    ok "Installed verified compatibility engine at ${DNSTT_BIN}."
 }
 
 generate_keys_if_needed() {
@@ -269,150 +196,138 @@ generate_keys_if_needed() {
         return 0
     fi
 
-    info "Generating a new DNSTT server keypair..."
+    info "Generating DNSTT keypair..."
     rm -f "$PRIVKEY_FILE" "$PUBKEY_FILE"
     "$DNSTT_BIN" -gen-key \
         -privkey-file "$PRIVKEY_FILE" \
         -pubkey-file "$PUBKEY_FILE"
-
     chmod 0400 "$PRIVKEY_FILE"
     chmod 0644 "$PUBKEY_FILE"
-    ok "New keypair generated."
-}
-
-write_runner() {
-    mkdir -p "$(dirname "$RUNNER_FILE")"
-
-    cat > "$RUNNER_FILE" <<'RUNNER'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-CONFIG_FILE="/etc/opencfg-dnstt/config"
-DNSTT_BIN="/usr/local/bin/dnstt-server"
-
-[[ -r "$CONFIG_FILE" ]] || {
-    echo "Missing config: $CONFIG_FILE" >&2
-    exit 1
-}
-
-# shellcheck disable=SC1090
-source "$CONFIG_FILE"
-
-exec "$DNSTT_BIN" \
-    -udp "${BIND_ADDR}:53" \
-    -mtu "${MTU}" \
-    -privkey-file "${PRIVKEY_FILE}" \
-    "${TUNNEL_DOMAIN}" \
-    "${BACKEND_HOST}:${BACKEND_PORT}"
-RUNNER
-
-    chmod 0755 "$RUNNER_FILE"
-}
-
-write_service() {
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=OpenCFG DNSTT Server
-Documentation=https://www.bamsoftware.com/software/dnstt/
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${RUNNER_FILE}
-Restart=on-failure
-RestartSec=3
-TimeoutStopSec=10
-LimitNOFILE=1048576
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-}
-
-udp53_conflicts() {
-    local bind_ip="$1"
-    local escaped_ip
-    escaped_ip="${bind_ip//./\\.}"
-
-    ss -H -lunp 2>/dev/null | awk '{print $4 " " substr($0, index($0,$5))}' |
-        grep -E "^(${escaped_ip}:53|0\.0\.0\.0:53|\*:53|\[::\]:53|:::53)[[:space:]]" || true
-}
-
-check_udp53() {
-    local bind_ip="$1"
-    local conflicts
-
-    conflicts="$(udp53_conflicts "$bind_ip")"
-    if [[ -n "$conflicts" ]]; then
-        echo
-        warn "Another process may conflict with DNSTT on ${bind_ip}:53/udp:"
-        echo "$conflicts"
-        echo
-        echo "This manager will NOT kill, stop, or reconfigure that service."
-        echo "Resolve the conflict manually, or choose another local bind address."
-        return 1
-    fi
-
-    return 0
-}
-
-check_backend_listener() {
-    local host="$1"
-    local port="$2"
-
-    if [[ "$host" != "127.0.0.1" && "$host" != "localhost" && "$host" != "::1" ]]; then
-        warn "Backend is not localhost (${host}:${port}); make sure that is intentional."
-        return 0
-    fi
-
-    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\])${port}$"; then
-        ok "Detected a TCP listener on port ${port}."
-    else
-        warn "No TCP listener was detected on port ${port}."
-        warn "DNSTT can still install, but connections will fail until your SSH/Xray/V2Ray backend is listening."
-    fi
+    ok "New DNSTT keypair generated."
 }
 
 save_config() {
-    local tunnel_domain="$1"
-    local ns_host="$2"
-    local bind_addr="$3"
-    local backend_host="$4"
-    local backend_port="$5"
-    local backend_mode="$6"
-    local mtu="$7"
+    local tunnel_domain="$1" ns_host="$2" bind_addr="$3"
+    local backend_host="$4" backend_port="$5" backend_mode="$6"
 
     mkdir -p "$BASE_DIR"
     chmod 0700 "$BASE_DIR"
-
-    cat > "$CONFIG_FILE" <<EOF
+    cat > "$CONFIG_FILE" <<EOF_CONFIG
 # OpenCFG DNSTT configuration
-# Managed by opencfg-dnstt. You may edit this file manually, then restart:
-# systemctl restart opencfg-dnstt
-
+# Edit manually if needed, then: systemctl restart opencfg-dnstt
 TUNNEL_DOMAIN="${tunnel_domain}"
 NS_HOST="${ns_host}"
 BIND_ADDR="${bind_addr}"
 BACKEND_HOST="${backend_host}"
 BACKEND_PORT="${backend_port}"
 BACKEND_MODE="${backend_mode}"
-MTU="${mtu}"
 PRIVKEY_FILE="${PRIVKEY_FILE}"
 PUBKEY_FILE="${PUBKEY_FILE}"
-EOF
-
+EOF_CONFIG
     chmod 0600 "$CONFIG_FILE"
+}
+
+format_backend_addr() {
+    local host="$1" port="$2"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]:%s' "$host" "$port"
+    else
+        printf '%s:%s' "$host" "$port"
+    fi
+}
+
+write_runner() {
+    mkdir -p "$ENGINE_DIR"
+    cat > "$RUNNER_FILE" <<'EOF_RUNNER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_FILE="/etc/opencfg-dnstt/config"
+DNSTT_BIN="/usr/local/lib/opencfg-dnstt/dns-server"
+
+[[ -r "$CONFIG_FILE" ]] || { echo "Missing config: $CONFIG_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+if [[ "$BACKEND_HOST" == *:* && "$BACKEND_HOST" != \[*\] ]]; then
+    BACKEND_ADDR="[${BACKEND_HOST}]:${BACKEND_PORT}"
+else
+    BACKEND_ADDR="${BACKEND_HOST}:${BACKEND_PORT}"
+fi
+
+exec "$DNSTT_BIN" \
+    -udp "${BIND_ADDR}:53" \
+    -privkey-file "${PRIVKEY_FILE}" \
+    "${TUNNEL_DOMAIN}" \
+    "${BACKEND_ADDR}"
+EOF_RUNNER
+    chmod 0755 "$RUNNER_FILE"
+}
+
+write_service() {
+    cat > "$SERVICE_FILE" <<EOF_SERVICE
+[Unit]
+Description=OpenCFG DNSTT Server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=${RUNNER_FILE}
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+KillSignal=SIGTERM
+LimitNOFILE=1048576
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+    systemctl daemon-reload
+}
+
+udp53_conflicts() {
+    local bind_ip="$1" escaped
+    escaped="${bind_ip//./\\.}"
+    ss -H -lunp 2>/dev/null | awk '{print $4 " " substr($0,index($0,$5))}' |
+        grep -E "^(${escaped}:53|0\\.0\\.0\\.0:53|\\*:53|\\[::\\]:53|:::53)[[:space:]]" || true
+}
+
+check_udp53() {
+    local conflicts
+    conflicts="$(udp53_conflicts "$1")"
+    if [[ -n "$conflicts" ]]; then
+        warn "UDP/53 is already occupied on ${1}:"
+        echo "$conflicts"
+        echo "OpenCFG will NOT kill or reconfigure that process."
+        return 1
+    fi
+    return 0
+}
+
+check_backend_listener() {
+    local host="$1" port="$2"
+    if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "::1" ]]; then
+        if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:|\\])${port}$"; then
+            ok "Detected TCP listener on backend port ${port}."
+        else
+            warn "No local TCP listener detected on port ${port}."
+        fi
+    fi
+}
+
+config_complete() {
+    load_config || return 1
+    [[ -n "${TUNNEL_DOMAIN:-}" && -n "${NS_HOST:-}" && -n "${BIND_ADDR:-}" &&
+       -n "${BACKEND_HOST:-}" && -n "${BACKEND_PORT:-}" && -n "${BACKEND_MODE:-}" ]]
 }
 
 configure_interactive() {
     local old_domain="" old_ns="" old_bind="" old_backend_host="127.0.0.1"
-    local old_backend_port="" old_mode="" old_mtu="1232"
-    local tunnel_domain ns_host bind_addr backend_host backend_port mode_choice backend_mode mtu
-    local detected_bind
+    local old_backend_port="" old_mode="" detected_bind
+    local tunnel_domain ns_host bind_addr backend_host backend_port backend_mode choice answer
 
     if load_config 2>/dev/null; then
         old_domain="${TUNNEL_DOMAIN:-}"
@@ -421,7 +336,6 @@ configure_interactive() {
         old_backend_host="${BACKEND_HOST:-127.0.0.1}"
         old_backend_port="${BACKEND_PORT:-}"
         old_mode="${BACKEND_MODE:-}"
-        old_mtu="${MTU:-1232}"
     fi
 
     detected_bind="$(detect_bind_ipv4)"
@@ -434,68 +348,40 @@ configure_interactive() {
     echo "  3) Custom local TCP service"
     echo
 
-    if [[ "$old_mode" == "SSH" ]]; then
-        read -r -p "Choose [1]: " mode_choice
-        mode_choice="${mode_choice:-1}"
-    elif [[ "$old_mode" == "Xray/V2Ray" ]]; then
-        read -r -p "Choose [2]: " mode_choice
-        mode_choice="${mode_choice:-2}"
-    else
-        read -r -p "Choose [2]: " mode_choice
-        mode_choice="${mode_choice:-2}"
-    fi
+    case "$old_mode" in
+        SSH) read -r -p "Choose [1]: " choice; choice="${choice:-1}" ;;
+        "Xray/V2Ray") read -r -p "Choose [2]: " choice; choice="${choice:-2}" ;;
+        *) read -r -p "Choose [2]: " choice; choice="${choice:-2}" ;;
+    esac
 
-    case "$mode_choice" in
-        1)
-            backend_mode="SSH"
-            backend_port="${old_backend_port:-22}"
-            [[ "$old_mode" != "SSH" ]] && backend_port="22"
-            ;;
-        2)
-            backend_mode="Xray/V2Ray"
-            backend_port="${old_backend_port:-443}"
-            [[ "$old_mode" != "Xray/V2Ray" ]] && backend_port="443"
-            ;;
-        3)
-            backend_mode="Custom"
-            backend_port="${old_backend_port:-443}"
-            ;;
-        *)
-            die "Invalid backend type."
-            ;;
+    case "$choice" in
+        1) backend_mode="SSH"; backend_port="${old_backend_port:-22}" ;;
+        2) backend_mode="Xray/V2Ray"; backend_port="${old_backend_port:-443}" ;;
+        3) backend_mode="Custom"; backend_port="${old_backend_port:-443}" ;;
+        *) die "Invalid backend type." ;;
     esac
 
     while true; do
-        read -r -p "Tunnel domain (example: t.example.com) [${old_domain}]: " tunnel_domain
-        tunnel_domain="${tunnel_domain:-$old_domain}"
-        tunnel_domain="${tunnel_domain,,}"
+        read -r -p "Tunnel domain [${old_domain}]: " tunnel_domain
+        tunnel_domain="${tunnel_domain:-$old_domain}"; tunnel_domain="${tunnel_domain,,}"
         valid_domain "$tunnel_domain" && break
-        warn "Enter a valid tunnel domain such as t.example.com."
+        warn "Enter a valid tunnel domain, e.g. t.example.com"
     done
 
     while true; do
-        read -r -p "Nameserver host (example: ns.example.com) [${old_ns}]: " ns_host
-        ns_host="${ns_host:-$old_ns}"
-        ns_host="${ns_host,,}"
+        read -r -p "Nameserver host [${old_ns}]: " ns_host
+        ns_host="${ns_host:-$old_ns}"; ns_host="${ns_host,,}"
         valid_domain "$ns_host" && break
-        warn "Enter a valid nameserver hostname such as ns.example.com."
+        warn "Enter a valid nameserver hostname, e.g. ns.example.com"
     done
-
-    if [[ "$ns_host" == *".${tunnel_domain}" || "$ns_host" == "$tunnel_domain" ]]; then
-        warn "The NS hostname should normally NOT be inside the tunnel zone."
-        warn "Example: tunnel=t.example.com, nameserver=ns.example.com"
-        read -r -p "Continue anyway? [y/N]: " _
-        [[ "${_:-}" =~ ^[Yy]$ ]] || return 1
-    fi
 
     while true; do
         read -r -p "Local bind IPv4 for UDP/53 [${detected_bind}]: " bind_addr
         bind_addr="${bind_addr:-$detected_bind}"
-        if [[ "$bind_addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && \
-           ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$bind_addr"; then
+        if valid_ipv4 "$bind_addr" && ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "$bind_addr"; then
             break
         fi
-        warn "Choose an IPv4 address that is actually assigned to this VPS."
+        warn "Choose an IPv4 address actually assigned to this VPS."
     done
 
     read -r -p "Backend host [${old_backend_host}]: " backend_host
@@ -508,82 +394,16 @@ configure_interactive() {
         warn "Port must be between 1 and 65535."
     done
 
-    while true; do
-        read -r -p "DNSTT response MTU [${old_mtu}]: " mtu
-        mtu="${mtu:-$old_mtu}"
-        valid_mtu "$mtu" && break
-        warn "MTU must be between 512 and 4096. 1232 is the recommended default."
-    done
-
-    save_config \
-        "$tunnel_domain" \
-        "$ns_host" \
-        "$bind_addr" \
-        "$backend_host" \
-        "$backend_port" \
-        "$backend_mode" \
-        "$mtu"
-
+    save_config "$tunnel_domain" "$ns_host" "$bind_addr" "$backend_host" "$backend_port" "$backend_mode"
     check_backend_listener "$backend_host" "$backend_port"
 }
 
-install_or_reconfigure() {
-    require_root
-    header
-    echo -e "${WHITE}Install / Reconfigure OpenCFG DNSTT${NC}"
-    echo
-    echo "This operation does NOT touch firewall rules, rc.local, resolv.conf,"
-    echo "systemd-resolved, SSH, Webmin, Xray, Nginx, or your existing VPN scripts."
-    echo
-
-    install_dependencies
-    install_self
-
-    if [[ ! -x "$DNSTT_BIN" ]]; then
-        build_dnstt
-    else
-        ok "Existing dnstt-server found: $DNSTT_BIN"
-    fi
-
-    generate_keys_if_needed
-    configure_interactive || return 0
-    write_runner
-    write_service
-
-    # Stop only our own service before checking the address.
-    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-
-    load_config
-    if ! check_udp53 "$BIND_ADDR"; then
-        warn "Configuration was saved, but the DNSTT service was not started."
-        warn "Run 'opencfg-dnstt' after resolving the UDP/53 conflict."
-        return 0
-    fi
-
-    systemctl enable --now "$SERVICE_NAME"
-
-    sleep 1
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "OpenCFG DNSTT is running."
-    else
-        warn "The service did not stay active. Recent logs:"
-        journalctl -u "$SERVICE_NAME" -n 30 --no-pager || true
-        return 0
-    fi
-
-    echo
-    show_info_no_pause
-}
-
 show_info_no_pause() {
-    load_config || {
-        warn "DNSTT is not configured yet."
-        return
-    }
-
-    local pubkey public_ip
+    load_config || { warn "DNSTT is not configured yet."; return; }
+    local pubkey public_ip engine
     pubkey="$(tr -d '[:space:]' < "$PUBKEY_FILE" 2>/dev/null || true)"
     public_ip="$(detect_public_ipv4)"
+    engine="$(cat "$ENGINE_MARKER" 2>/dev/null || echo unknown)"
 
     echo -e "${BLUE}──────────────────── DNSTT CONFIGURATION ────────────────────${NC}"
     echo -e "Mode            : ${WHITE}${BACKEND_MODE}${NC}"
@@ -591,164 +411,109 @@ show_info_no_pause() {
     echo -e "Nameserver host : ${WHITE}${NS_HOST}${NC}"
     echo -e "Local UDP bind  : ${WHITE}${BIND_ADDR}:53${NC}"
     echo -e "Backend         : ${WHITE}${BACKEND_HOST}:${BACKEND_PORT}${NC}"
-    echo -e "MTU             : ${WHITE}${MTU}${NC}"
+    echo -e "Engine          : ${WHITE}${engine}${NC}"
     echo -e "Public key      : ${WHITE}${pubkey:-Unavailable}${NC}"
     [[ -n "$public_ip" ]] && echo -e "Public IPv4     : ${WHITE}${public_ip}${NC}"
-
     echo
-    echo -e "${BLUE}DNS records you need:${NC}"
-    if [[ -n "$public_ip" ]]; then
-        echo "  A    ${NS_HOST}      -> ${public_ip}"
-    else
-        echo "  A    ${NS_HOST}      -> YOUR_VPS_PUBLIC_IPV4"
-    fi
+    echo "DNS delegation:"
+    [[ -n "$public_ip" ]] && echo "  A    ${NS_HOST} -> ${public_ip}"
     echo "  NS   ${TUNNEL_DOMAIN} -> ${NS_HOST}"
-    echo
-    echo "If you use Cloudflare DNS, keep the nameserver A record DNS-only (not proxied)."
-    echo "Your VPS/provider firewall or security group must allow inbound UDP port 53."
-    echo
-    echo -e "${YELLOW}Important:${NC} this manager intentionally does not open that port for you."
 }
 
-show_info() {
-    header
-    show_info_no_pause
-    pause
-}
-
-change_backend() {
+install_or_reconfigure() {
     require_root
-    load_config || {
-        warn "Install/configure DNSTT first."
-        pause
-        return
+    header
+    echo -e "${WHITE}Install / Repair OpenCFG DNSTT${NC}"
+    echo
+    echo "No firewall, rc.local, resolver, SSH, Webmin, Nginx, Xray or OpenVPN changes are made."
+    echo
+
+    install_dependencies
+    install_self
+
+    # Stop only our own service before replacing/repairing its engine.
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+
+    install_engine
+    generate_keys_if_needed
+
+    if config_complete; then
+        echo
+        echo "Existing OpenCFG DNSTT configuration found:"
+        echo "  Tunnel  : ${TUNNEL_DOMAIN}"
+        echo "  Bind    : ${BIND_ADDR}:53/udp"
+        echo "  Backend : ${BACKEND_HOST}:${BACKEND_PORT}"
+        echo
+        read -r -p "Keep this configuration and only repair/upgrade the engine? [Y/n]: " answer
+        if [[ "${answer:-Y}" =~ ^[Nn]$ ]]; then
+            configure_interactive
+        else
+            ok "Existing configuration kept."
+        fi
+    else
+        configure_interactive
+    fi
+
+    write_runner
+    write_service
+    load_config
+
+    check_backend_listener "$BACKEND_HOST" "$BACKEND_PORT"
+    check_udp53 "$BIND_ADDR" || {
+        warn "Configuration is saved, but service was not started because UDP/53 is occupied."
+        return 0
     }
 
-    header
-    echo -e "${WHITE}Change backend only${NC}"
-    echo
-    echo "Current: ${BACKEND_MODE} -> ${BACKEND_HOST}:${BACKEND_PORT}"
-    echo
-    echo "  1) SSH / Dropbear"
-    echo "  2) Xray / V2Ray / 3x-ui"
-    echo "  3) Custom TCP"
-    echo
-    read -r -p "Choose: " choice
-
-    local new_mode new_port new_host answer
-    new_host="$BACKEND_HOST"
-
-    case "$choice" in
-        1) new_mode="SSH"; new_port="22" ;;
-        2) new_mode="Xray/V2Ray"; new_port="443" ;;
-        3) new_mode="Custom"; new_port="$BACKEND_PORT" ;;
-        *)
-            warn "Invalid option."
-            pause
-            return
-            ;;
-    esac
-
-    read -r -p "Backend host [${new_host}]: " answer
-    new_host="${answer:-$new_host}"
-
-    while true; do
-        read -r -p "Backend port [${new_port}]: " answer
-        new_port="${answer:-$new_port}"
-        valid_port "$new_port" && break
-        warn "Port must be between 1 and 65535."
-    done
-
-    save_config \
-        "$TUNNEL_DOMAIN" \
-        "$NS_HOST" \
-        "$BIND_ADDR" \
-        "$new_host" \
-        "$new_port" \
-        "$new_mode" \
-        "$MTU"
-
-    check_backend_listener "$new_host" "$new_port"
+    systemctl enable "$SERVICE_NAME" >/dev/null
     systemctl restart "$SERVICE_NAME"
+    sleep 1
 
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "Backend changed to ${new_host}:${new_port}."
+        ok "OpenCFG DNSTT is running."
     else
-        warn "DNSTT failed to restart. Check logs from the menu."
+        warn "DNSTT failed to stay active. Recent logs:"
+        journalctl -u "$SERVICE_NAME" -n 40 --no-pager || true
+        return 0
     fi
-    pause
-}
 
-change_domain() {
-    require_root
-    load_config || {
-        warn "Install/configure DNSTT first."
-        pause
-        return
-    }
-
-    header
-    echo -e "${WHITE}Change tunnel DNS names${NC}"
-    echo
-
-    local new_domain new_ns
-    while true; do
-        read -r -p "Tunnel domain [${TUNNEL_DOMAIN}]: " new_domain
-        new_domain="${new_domain:-$TUNNEL_DOMAIN}"
-        new_domain="${new_domain,,}"
-        valid_domain "$new_domain" && break
-        warn "Enter a valid domain."
-    done
-
-    while true; do
-        read -r -p "Nameserver host [${NS_HOST}]: " new_ns
-        new_ns="${new_ns:-$NS_HOST}"
-        new_ns="${new_ns,,}"
-        valid_domain "$new_ns" && break
-        warn "Enter a valid domain."
-    done
-
-    save_config \
-        "$new_domain" \
-        "$new_ns" \
-        "$BIND_ADDR" \
-        "$BACKEND_HOST" \
-        "$BACKEND_PORT" \
-        "$BACKEND_MODE" \
-        "$MTU"
-
-    systemctl restart "$SERVICE_NAME"
-    ok "Tunnel domain settings updated."
     echo
     show_info_no_pause
-    pause
 }
+
+service_state() {
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        echo -e "${GREEN}ACTIVE${NC}"
+    elif [[ -f "$SERVICE_FILE" ]]; then
+        echo -e "${YELLOW}STOPPED${NC}"
+    else
+        echo -e "${DIM}NOT INSTALLED${NC}"
+    fi
+}
+
+show_dashboard() {
+    echo -e "  Service : $(service_state)"
+    if load_config 2>/dev/null; then
+        echo -e "  Mode    : ${WHITE}${BACKEND_MODE:-?}${NC}"
+        echo -e "  Domain  : ${WHITE}${TUNNEL_DOMAIN:-?}${NC}"
+        echo -e "  Listen  : ${WHITE}${BIND_ADDR:-?}:53/udp${NC}"
+        echo -e "  Backend : ${WHITE}${BACKEND_HOST:-?}:${BACKEND_PORT:-?}${NC}"
+    fi
+    echo -e "  Engine  : ${WHITE}Leitura-compatible pinned DNSTT${NC}"
+    echo
+    echo -e "${DIM}Firewall untouched | resolver untouched | rc.local untouched${NC}"
+    echo
+}
+
+show_info() { header; show_info_no_pause; pause; }
+status_service() { header; systemctl status "$SERVICE_NAME" --no-pager -l || true; pause; }
+show_logs() { header; journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true; pause; }
 
 start_service() {
     require_root
-    if [[ ! -f "$SERVICE_FILE" ]]; then
-        warn "DNSTT is not installed yet."
-        pause
-        return
-    fi
-    load_config || {
-        warn "DNSTT config is missing."
-        pause
-        return
-    }
-
-    if ! check_udp53 "$BIND_ADDR"; then
-        # If the existing listener is our own already-running service, this
-        # path is only reached when trying to start while already active.
-        if systemctl is-active --quiet "$SERVICE_NAME"; then
-            ok "OpenCFG DNSTT is already running."
-        else
-            warn "Cannot start because UDP/53 is occupied."
-        fi
-        pause
-        return
-    fi
-
+    [[ -f "$SERVICE_FILE" ]] || { warn "DNSTT is not installed."; pause; return; }
+    if systemctl is-active --quiet "$SERVICE_NAME"; then ok "Already running."; pause; return; fi
+    load_config || { warn "Config missing."; pause; return; }
+    check_udp53 "$BIND_ADDR" || { pause; return; }
     systemctl start "$SERVICE_NAME"
     ok "OpenCFG DNSTT started."
     pause
@@ -757,11 +522,7 @@ start_service() {
 restart_service() {
     require_root
     systemctl restart "$SERVICE_NAME"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        ok "OpenCFG DNSTT restarted."
-    else
-        warn "DNSTT did not restart successfully."
-    fi
+    systemctl is-active --quiet "$SERVICE_NAME" && ok "OpenCFG DNSTT restarted." || warn "Restart failed."
     pause
 }
 
@@ -772,140 +533,147 @@ stop_service() {
     pause
 }
 
-status_service() {
+change_backend() {
+    require_root
+    load_config || { warn "Install/configure DNSTT first."; pause; return; }
     header
-    systemctl status "$SERVICE_NAME" --no-pager -l || true
+    echo "Current backend: ${BACKEND_HOST}:${BACKEND_PORT}"
+    local host port answer
+    read -r -p "Backend host [${BACKEND_HOST}]: " host
+    host="${host:-$BACKEND_HOST}"
+    while true; do
+        read -r -p "Backend TCP port [${BACKEND_PORT}]: " answer
+        port="${answer:-$BACKEND_PORT}"
+        valid_port "$port" && break
+        warn "Port must be 1-65535."
+    done
+    save_config "$TUNNEL_DOMAIN" "$NS_HOST" "$BIND_ADDR" "$host" "$port" "$BACKEND_MODE"
+    check_backend_listener "$host" "$port"
+    systemctl restart "$SERVICE_NAME"
+    ok "Backend changed to ${host}:${port}."
     pause
 }
 
-show_logs() {
+change_domain() {
+    require_root
+    load_config || { warn "Install/configure DNSTT first."; pause; return; }
     header
-    journalctl -u "$SERVICE_NAME" -n 100 --no-pager || true
+    local domain ns
+    while true; do
+        read -r -p "Tunnel domain [${TUNNEL_DOMAIN}]: " domain
+        domain="${domain:-$TUNNEL_DOMAIN}"; domain="${domain,,}"
+        valid_domain "$domain" && break
+        warn "Invalid domain."
+    done
+    while true; do
+        read -r -p "Nameserver host [${NS_HOST}]: " ns
+        ns="${ns:-$NS_HOST}"; ns="${ns,,}"
+        valid_domain "$ns" && break
+        warn "Invalid domain."
+    done
+    save_config "$domain" "$ns" "$BIND_ADDR" "$BACKEND_HOST" "$BACKEND_PORT" "$BACKEND_MODE"
+    systemctl restart "$SERVICE_NAME"
+    ok "DNS names updated."
     pause
 }
 
 regenerate_keys() {
     require_root
-    [[ -x "$DNSTT_BIN" ]] || {
-        warn "dnstt-server is not installed."
-        pause
-        return
-    }
-
     header
-    echo -e "${YELLOW}Regenerating keys will invalidate the old public key in every client config.${NC}"
-    echo
-    read -r -p "Generate a new DNSTT keypair? [y/N]: " answer
+    echo -e "${YELLOW}This changes the public key used by every client.${NC}"
+    read -r -p "Generate new DNSTT keys? [y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
-
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$PRIVKEY_FILE" "$PUBKEY_FILE"
     generate_keys_if_needed
-
-    if [[ -f "$CONFIG_FILE" ]]; then
-        systemctl start "$SERVICE_NAME" || true
-    fi
-
-    ok "New keypair created."
-    echo
+    [[ -f "$CONFIG_FILE" ]] && systemctl restart "$SERVICE_NAME" || true
     show_info_no_pause
     pause
 }
 
-rebuild_dnstt() {
+repair_engine() {
     require_root
     header
-    echo -e "${WHITE}Rebuild official DNSTT ${DNSTT_VERSION}${NC}"
-    echo
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    rm -f "$ENGINE_MARKER"
     install_dependencies
-    build_dnstt
-
-    if [[ -f "$SERVICE_FILE" ]]; then
-        systemctl restart "$SERVICE_NAME" || true
+    install_engine
+    write_runner
+    write_service
+    if [[ -f "$CONFIG_FILE" ]]; then
+        load_config
+        if check_udp53 "$BIND_ADDR"; then
+            systemctl enable "$SERVICE_NAME" >/dev/null
+            systemctl restart "$SERVICE_NAME"
+        fi
     fi
-
-    ok "DNSTT binary rebuilt from source."
+    ok "Compatibility engine repaired and verified."
     pause
 }
 
-dns_help() {
+diagnostics() {
+    require_root
     header
-    echo -e "${WHITE}DNSTT DNS setup${NC}"
+    echo -e "${WHITE}OpenCFG DNSTT diagnostics${NC}"
     echo
-    echo "Example:"
-    echo "  VPS public IPv4 : 203.0.113.10"
-    echo "  NS hostname     : ns.example.com"
-    echo "  Tunnel domain   : t.example.com"
+    echo "App version : ${APP_VERSION}"
+    echo "Engine path : ${DNSTT_BIN}"
+    echo "Engine ID   : $(cat "$ENGINE_MARKER" 2>/dev/null || echo missing)"
+    if [[ -x "$DNSTT_BIN" ]] && verify_git_blob "$DNSTT_BIN"; then
+        ok "Engine Git blob matches pinned working binary."
+    else
+        warn "Engine binary is missing or does not match the pinned working binary."
+    fi
     echo
-    echo "Create:"
-    echo "  A    ns.example.com    -> 203.0.113.10"
-    echo "  NS   t.example.com     -> ns.example.com"
+    systemctl status "$SERVICE_NAME" --no-pager -l || true
     echo
-    echo "The NS hostname should not be inside the tunnel zone."
-    echo "Good: tunnel=t.example.com, NS=ns.example.com"
-    echo "Avoid: tunnel=t.example.com, NS=ns.t.example.com"
+    echo "UDP/53 listeners:"
+    ss -lunp | grep -E '(:53[[:space:]]|:53$)' || true
     echo
-    echo "Also allow inbound UDP/53 in your cloud/VPS provider firewall."
-    echo
-    echo -e "${YELLOW}This script intentionally makes zero firewall changes.${NC}"
+    if load_config 2>/dev/null; then
+        echo "Backend expected: $(format_backend_addr "$BACKEND_HOST" "$BACKEND_PORT")"
+        check_backend_listener "$BACKEND_HOST" "$BACKEND_PORT"
+    fi
     pause
 }
 
 uninstall_manager() {
     require_root
     header
-    echo -e "${YELLOW}This removes only OpenCFG DNSTT files and its systemd service.${NC}"
-    echo "It will NOT remove or modify SSH, Xray, 3x-ui, Nginx, Webmin,"
-    echo "OpenVPN, iptables, nftables, UFW, firewalld, or DNS resolver settings."
-    echo
+    echo "This removes only OpenCFG DNSTT files/service."
     read -r -p "Uninstall OpenCFG DNSTT? [y/N]: " answer
     [[ "$answer" =~ ^[Yy]$ ]] || return 0
-
     systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
-
-    rm -f "$RUNNER_FILE"
-    rmdir "$(dirname "$RUNNER_FILE")" 2>/dev/null || true
-
-    rm -f "$DNSTT_BIN"
-    rm -rf "$BASE_DIR"
+    rm -rf "$ENGINE_DIR" "$BASE_DIR"
     rm -f "$MANAGER_LINK"
-
-    ok "OpenCFG DNSTT service, config, keys, and binary removed."
-    echo "The private Go build toolchain at ${GO_ROOT} was kept."
-    echo "Remove it manually if you want: rm -rf ${GO_ROOT}"
-    echo
-    echo "The current manager process will exit now."
-
-    # Do this last because the currently running copy may be MANAGER_PATH.
     rm -f "$MANAGER_PATH"
+    echo "OpenCFG DNSTT removed."
     exit 0
 }
 
 menu() {
     require_root
-
     while true; do
         header
         show_dashboard
-        echo -e "${BLUE}[01]${NC} Install / Reconfigure DNSTT"
+        echo -e "${BLUE}[01]${NC} Install / Repair / Reconfigure"
         echo -e "${BLUE}[02]${NC} Show configuration + public key"
-        echo -e "${BLUE}[03]${NC} Change backend (SSH / V2Ray / custom)"
+        echo -e "${BLUE}[03]${NC} Change backend"
         echo -e "${BLUE}[04]${NC} Change tunnel domain / NS"
         echo -e "${BLUE}[05]${NC} Start DNSTT"
         echo -e "${BLUE}[06]${NC} Restart DNSTT"
         echo -e "${BLUE}[07]${NC} Stop DNSTT"
         echo -e "${BLUE}[08]${NC} Service status"
-        echo -e "${BLUE}[09]${NC} View recent logs"
-        echo -e "${BLUE}[10]${NC} Regenerate DNSTT keys"
-        echo -e "${BLUE}[11]${NC} Rebuild official DNSTT from source"
-        echo -e "${BLUE}[12]${NC} DNS setup help"
+        echo -e "${BLUE}[09]${NC} Recent logs"
+        echo -e "${BLUE}[10]${NC} Regenerate keys"
+        echo -e "${BLUE}[11]${NC} Repair compatibility engine"
+        echo -e "${BLUE}[12]${NC} Diagnostics"
         echo -e "${BLUE}[13]${NC} Uninstall OpenCFG DNSTT"
         echo -e "${BLUE}[00]${NC} Exit"
         echo
         read -r -p "Select an option: " option
-
         case "$option" in
             1|01) install_or_reconfigure; pause ;;
             2|02) show_info ;;
@@ -917,63 +685,41 @@ menu() {
             8|08) status_service ;;
             9|09) show_logs ;;
             10) regenerate_keys ;;
-            11) rebuild_dnstt ;;
-            12) dns_help ;;
+            11) repair_engine ;;
+            12) diagnostics ;;
             13) uninstall_manager ;;
-            0|00) clear; exit 0 ;;
+            0|00) clear 2>/dev/null || true; exit 0 ;;
             *) warn "Invalid option."; sleep 1 ;;
         esac
     done
 }
 
 case "${1:-}" in
-    --install|install)
-        install_or_reconfigure
-        ;;
-    --info|info)
-        require_root
-        show_info_no_pause
-        ;;
-    --start|start)
-        require_root
-        systemctl start "$SERVICE_NAME"
-        ;;
-    --stop|stop)
-        require_root
-        systemctl stop "$SERVICE_NAME"
-        ;;
-    --restart|restart)
-        require_root
-        systemctl restart "$SERVICE_NAME"
-        ;;
-    --status|status)
-        require_root
-        systemctl status "$SERVICE_NAME" --no-pager -l
-        ;;
-    --logs|logs)
-        require_root
-        journalctl -u "$SERVICE_NAME" -n 100 --no-pager
-        ;;
+    --install|install) install_or_reconfigure ;;
+    --info|info) require_root; show_info_no_pause ;;
+    --start|start) require_root; systemctl start "$SERVICE_NAME" ;;
+    --stop|stop) require_root; systemctl stop "$SERVICE_NAME" ;;
+    --restart|restart) require_root; systemctl restart "$SERVICE_NAME" ;;
+    --status|status) require_root; systemctl status "$SERVICE_NAME" --no-pager -l ;;
+    --logs|logs) require_root; journalctl -u "$SERVICE_NAME" -n 100 --no-pager ;;
+    --diagnostics|diagnostics) diagnostics ;;
     --help|-h|help)
-        cat <<EOF
+        cat <<EOF_HELP
 ${APP_NAME} ${APP_VERSION}
 by ${AUTHOR}
 
+Compatibility engine:
+  pinned Leitura SlowDNS dns-server Git blob ${ENGINE_GIT_BLOB_SHA1}
+
 Usage:
-  opencfg-dnstt              Open interactive menu
-  opencfg-dnstt --install    Install/reconfigure
-  opencfg-dnstt --info       Show config and public key
-  opencfg-dnstt --start      Start service
-  opencfg-dnstt --stop       Stop service
-  opencfg-dnstt --restart    Restart service
-  opencfg-dnstt --status     Show service status
-  opencfg-dnstt --logs       Show recent logs
-EOF
+  opencfg-dnstt                 Open menu
+  opencfg-dnstt --install       Install/repair/reconfigure
+  opencfg-dnstt --info          Show config/public key
+  opencfg-dnstt --status        Service status
+  opencfg-dnstt --logs          Recent logs
+  opencfg-dnstt --diagnostics   Verify engine/service/listeners
+EOF_HELP
         ;;
-    "")
-        menu
-        ;;
-    *)
-        die "Unknown argument: ${1}. Use --help."
-        ;;
+    "") menu ;;
+    *) die "Unknown argument: ${1}. Use --help." ;;
 esac
